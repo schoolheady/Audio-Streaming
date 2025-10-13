@@ -41,7 +41,7 @@ public class Server{
     }
 
     // function that receives packages from client and sends it to other clients except origin (UDP)
-    private void udpReceive() throws Exception{ // repeats message
+    private void udpReceive() throws Exception{ 
             while (!Thread.currentThread().isInterrupted()) {
                 byte[] buf = new byte[MAX_PACKET_SIZE];
                 DatagramPacket packet = new DatagramPacket(buf, buf.length);
@@ -54,15 +54,13 @@ public class Server{
                 System.out.println("[SERVER] - Received packet from " + srcAddr + ":" + srcPort + " with length " + copy.length);
                 workerPool.submit(() -> {
                     try {
-                        handleAudioStream(packet);
+                            processPacket(copy, srcAddr, srcPort);
                     } catch (Exception e) {
                         e.printStackTrace();
                     }
                 });
                 
             }
-
-
     }
 
     // function that handles commands from client (TCP)
@@ -117,22 +115,56 @@ public class Server{
 
     }
 
-    private void handleAudioStream(DatagramPacket packet) throws Exception{ 
-            // receive a packet from the reader
+    private void processPacket(byte[] data, InetAddress srcAddr, int srcPort) throws Exception{
+        // Deserialize the audio packet
+        AudioPacket audioPacket = deserializeAudioPacket(data);
+
+        // Update client state
+        ClientState state = clientStates.computeIfAbsent(audioPacket.clientId, id -> new ClientState());
+        state.lastHeard = System.currentTimeMillis();
+
+        state.clientAddress = srcAddr.toString();
+        state.clientPort = srcPort;
+        state.clientId = audioPacket.clientId;
+        // Check for expected sequence number
+        if (audioPacket.sequenceNumber == state.expectedSeq) {
+            // Process the packet
+            System.out.println("[SERVER] - Processing audio packet from " + srcAddr + ":" + srcPort);
+            state.expectedSeq++;
+        } else {
+            // Out of order packet
+            System.out.println("[SERVER] - Out of order packet from " + srcAddr + ":" + srcPort);
+            state.buffer.put(audioPacket.sequenceNumber, audioPacket);
+        }
     }
 
-    
+    // 1 byte client ID 4 bytes sequence number 2 bytes audio data length 320 bytes audio data
+    private AudioPacket deserializeAudioPacket(byte[] data) {
+        int clientId = data[0] & 0xFF; // ensure unsigned
+        int sequenceNumber = ((data[1] & 0xFF) << 24)
+                        |    ((data[2] & 0xFF) << 16)
+                        |    ((data[3] & 0xFF) << 8)
+                        |    (data[4] & 0xFF);
+        int audioDataLength = ((data[5] & 0xFF) << 8) | (data[6] & 0xFF);
+        
+        // safety check
+        if (audioDataLength > data.length - 7) {
+            throw new IllegalArgumentException("Audio data length exceeds packet size");
+        }
+
+        byte[] audioData = Arrays.copyOfRange(data, 7, 7 + audioDataLength);
+        return new AudioPacket(clientId, sequenceNumber, audioData);
+    }
+
 }
 
-class ClientInfo {
-    String id;
-    InetAddress address;
-    int udpPort;
-}
+
 
 class ClientState {
-    int clientId; // optional, for reference
-    int expectedSeq = 0; // next sequence number we expect
+    int clientId; 
+    int clientPort; 
+    String clientAddress; 
+    int expectedSeq = 0; 
     NavigableMap<Integer, AudioPacket> buffer = new TreeMap<>(); 
         // holds packets keyed by sequence number
     long lastHeard; // timestamp of last packet from this client
@@ -141,11 +173,11 @@ class ClientState {
 
 class AudioPacket {
     public int clientId;
-    public long sequenceNumber;
+    public int sequenceNumber;
     public byte[] audioData;
     public long timestamp;
 
-    public AudioPacket(int clientId, long sequenceNumber, byte[] audioData) {
+    public AudioPacket(int clientId, int sequenceNumber, byte[] audioData) {
         this.clientId = clientId;
         this.sequenceNumber = sequenceNumber;
         this.audioData = audioData;
