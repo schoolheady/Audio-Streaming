@@ -114,29 +114,51 @@ public class Server{
         }
 
     }
-
-    private void processPacket(byte[] data, InetAddress srcAddr, int srcPort) throws Exception{
+    private void processPacket(byte[] data, InetAddress srcAddr, int srcPort) throws Exception {
         // Deserialize the audio packet
         AudioPacket audioPacket = deserializeAudioPacket(data);
 
-        // Update client state
+        // Get or create per-client state
         ClientState state = clientStates.computeIfAbsent(audioPacket.clientId, id -> new ClientState());
-        state.lastHeard = System.currentTimeMillis();
 
-        state.clientAddress = srcAddr.toString();
-        state.clientPort = srcPort;
-        state.clientId = audioPacket.clientId;
-        // Check for expected sequence number
-        if (audioPacket.sequenceNumber == state.expectedSeq) {
-            // Process the packet
-            System.out.println("[SERVER] - Processing audio packet from " + srcAddr + ":" + srcPort);
-            state.expectedSeq++;
-        } else {
-            // Out of order packet
-            System.out.println("[SERVER] - Out of order packet from " + srcAddr + ":" + srcPort);
+        synchronized (state) {
+            // Update last seen info
+            state.lastHeard = System.currentTimeMillis();
+            state.clientAddress = srcAddr; // store InetAddress directly
+            state.clientPort = srcPort;
+            state.clientId = audioPacket.clientId;
+
+            // Add packet to buffer
             state.buffer.put(audioPacket.sequenceNumber, audioPacket);
+
+            // Process in-order packets starting from expectedSeq
+            List<AudioPacket> toSend = new ArrayList<>();
+            while (state.buffer.containsKey(state.expectedSeq)) {
+                AudioPacket next = state.buffer.remove(state.expectedSeq);
+                toSend.add(next);
+                state.expectedSeq++;
+            }
+
+            // Forward collected packets to other clients
+            if (!toSend.isEmpty()) {
+                for (ClientState clientState : clientStates.values()) { // eventually use a list of clients connected via TCP
+                    if (clientState.clientId == audioPacket.clientId) continue; // skip sender
+
+                    for (AudioPacket pkt : toSend) {
+                        byte[] serialized = serializeAudioPacket(pkt);
+                        DatagramPacket outPacket = new DatagramPacket(
+                            serialized,
+                            serialized.length,
+                            clientState.clientAddress,
+                            clientState.clientPort
+                        );
+                        socket.send(outPacket);
+                    }
+                }
+            }
         }
     }
+
 
     // 1 byte client ID 4 bytes sequence number 2 bytes audio data length 320 bytes audio data
     private AudioPacket deserializeAudioPacket(byte[] data) {
@@ -156,14 +178,32 @@ public class Server{
         return new AudioPacket(clientId, sequenceNumber, audioData);
     }
 
+    private byte[] serializeAudioPacket(AudioPacket pkt) {
+        byte[] data = new byte[7 + pkt.audioData.length];
+        data[0] = (byte) pkt.clientId;
+        data[1] = (byte) (pkt.sequenceNumber >> 24);
+        data[2] = (byte) (pkt.sequenceNumber >> 16);
+        data[3] = (byte) (pkt.sequenceNumber >> 8);
+        data[4] = (byte) pkt.sequenceNumber;
+        data[5] = (byte) (pkt.audioData.length >> 8);
+        data[6] = (byte) pkt.audioData.length;
+        System.arraycopy(pkt.audioData, 0, data, 7, pkt.audioData.length);
+        return data;
+    }
+
 }
 
+class ClientInfo {
+    String id;
+    InetAddress address;
+    int udpPort;
+}
 
 
 class ClientState {
     int clientId; 
     int clientPort; 
-    String clientAddress; 
+    InetAddress clientAddress; 
     int expectedSeq = 0; 
     NavigableMap<Integer, AudioPacket> buffer = new TreeMap<>(); 
         // holds packets keyed by sequence number
