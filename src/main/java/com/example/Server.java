@@ -6,8 +6,16 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.net.*;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 
 public class Server{
@@ -15,7 +23,12 @@ public class Server{
     private byte[] buffer = new byte[256];
     private Map<String, ClientInfo> clients = new HashMap<>();
 
+    private final ExecutorService workerPool = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+    private final ConcurrentHashMap<Integer, ClientState> clientStates;
+    private static final int MAX_PACKET_SIZE = 1500;
+
     public Server(DatagramSocket socket) throws Exception{
+        this.clientStates = new ConcurrentHashMap<>();
         this.socket = socket;
     }
 
@@ -28,22 +41,27 @@ public class Server{
     }
 
     // function that receives packages from client and sends it to other clients except origin (UDP)
-    private void receiveThenSend() throws Exception{ // repeats message
-        while(true){
+    private void udpReceive() throws Exception{ // repeats message
+            while (!Thread.currentThread().isInterrupted()) {
+                byte[] buf = new byte[MAX_PACKET_SIZE];
+                DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                socket.receive(packet);
 
-                DatagramPacket packet = new DatagramPacket(buffer,buffer.length);
-                String messageFromClient = new String(packet.getData(), 0, packet.getLength());
-                System.out.println("[SERVER] - Received message from client: " + messageFromClient);
+                // copy only valid bytes
+                byte[] copy = Arrays.copyOf(packet.getData(), packet.getLength());
+                InetAddress srcAddr = packet.getAddress();
+                int srcPort = packet.getPort();
+                System.out.println("[SERVER] - Received packet from " + srcAddr + ":" + srcPort + " with length " + copy.length);
+                workerPool.submit(() -> {
+                    try {
+                        handleAudioStream(packet);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                });
+                
+            }
 
-                for (ClientInfo c : clients.values()) {
-                    // Assuming you want to forward the received packet to other clients
-                    // We need to create a new packet to send
-                    DatagramPacket sendPacket = new DatagramPacket(packet.getData(), packet.getLength(), c.address, c.udpPort);
-                    socket.send(sendPacket);
-                }
-
-        
-        }
 
     }
 
@@ -99,16 +117,8 @@ public class Server{
 
     }
 
-    private void handleAudioStream() throws Exception{
-        // TO-DO
-        int clientid = 0;
-        int sequenceNumber = 0;
-        byte[] audioBuffer = new byte[1024]; 
-
-        // send the audio stream in order of sequence number
-        // TO-DO
-
-
+    private void handleAudioStream(DatagramPacket packet) throws Exception{ 
+            // receive a packet from the reader
     }
 
     
@@ -118,4 +128,27 @@ class ClientInfo {
     String id;
     InetAddress address;
     int udpPort;
+}
+
+class ClientState {
+    int clientId; // optional, for reference
+    int expectedSeq = 0; // next sequence number we expect
+    NavigableMap<Integer, AudioPacket> buffer = new TreeMap<>(); 
+        // holds packets keyed by sequence number
+    long lastHeard; // timestamp of last packet from this client
+}
+
+
+class AudioPacket {
+    public int clientId;
+    public long sequenceNumber;
+    public byte[] audioData;
+    public long timestamp;
+
+    public AudioPacket(int clientId, long sequenceNumber, byte[] audioData) {
+        this.clientId = clientId;
+        this.sequenceNumber = sequenceNumber;
+        this.audioData = audioData;
+        this.timestamp = System.currentTimeMillis();
+    }
 }
