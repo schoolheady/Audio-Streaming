@@ -6,6 +6,8 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.net.*;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -20,6 +22,7 @@ import java.util.concurrent.Executors;
 
 public class Server{
     private final DatagramSocket socket; 
+    private static final Logger logger = Logger.getLogger(Server.class.getName());
 
     private static final CopyOnWriteArrayList<Socket> tcpClients = new CopyOnWriteArrayList<>();
     private final ConcurrentHashMap<Socket, Integer> tcpSocketToClientId = new ConcurrentHashMap<>();
@@ -48,20 +51,20 @@ public class Server{
 
 
     public void startTCPServer() throws Exception{
-    System.out.println("[SERVER] - Server started");
+    logger.info("[SERVER] - Server started");
         new Thread(() -> {
             try {
                 tcpConnection();
             } catch (Exception e) {
-                System.err.println("[TCP] - accept loop error: " + e);
+                logger.log(Level.SEVERE, "[TCP] - accept loop error", e);
             }
         }, "tcp-accept-thread").start();
 
         scheduler.scheduleAtFixedRate(() -> {
-            try {
+                try {
                 heartbeat();
             } catch (Exception e) {
-                System.err.println("[HEARTBEAT] - error: " + e);
+                logger.log(Level.WARNING, "[HEARTBEAT] - error", e);
             }
         }, HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
 
@@ -76,13 +79,13 @@ public class Server{
             synchronized (st) {
                 if (st.lastHeard > 0 && now - st.lastHeard > CLIENT_TIMEOUT_MS) {
                     if (st.status != ClientStatus.DISCONNECTED && st.status != ClientStatus.LEFT) {
-                        System.out.println("[HEARTBEAT] - Marking clientId=" + st.clientId + " DISCONNECTED due to timeout");
+                        logger.info("[HEARTBEAT] - Marking clientId=" + st.clientId + " DISCONNECTED due to timeout");
                         st.status = ClientStatus.DISCONNECTED;
                     }
                 }
 
                 if (st.status == ClientStatus.DISCONNECTED && now - st.lastHeard > CLIENT_REMOVAL_MS) {
-                    System.out.println("[HEARTBEAT] - Removing stale clientId=" + id + " after grace period");
+                    logger.info("[HEARTBEAT] - Removing stale clientId=" + id + " after grace period");
                     clientStates.remove(id);
                     tcpSocketToClientId.values().removeIf(v -> v.equals(id));
                 }
@@ -98,8 +101,8 @@ public class Server{
                 BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(out));
                 writer.write("HEARTBEAT\n");
                 writer.flush();
-            } catch (IOException e) {
-                System.out.println("Client disconnected (TCP): " + client.getRemoteSocketAddress() + " -> " + e.getMessage());
+                } catch (IOException e) {
+                logger.log(Level.INFO, "Client disconnected (TCP): " + client.getRemoteSocketAddress(), e);
                 // mark associated clientId as DISCONNECTED and remove tcp client mapping
                 Integer clientId = tcpSocketToClientId.remove(client);
                 if (clientId != null) {
@@ -124,7 +127,7 @@ public class Server{
                 } catch (SocketException se) {
                     // If socket was closed as part of shutdown, exit gracefully
                     if (socket.isClosed()) {
-                        System.out.println("[UDP] - Socket closed, stopping udpReceive");
+                        logger.info("[UDP] - Socket closed, stopping udpReceive");
                         break;
                     }
                     throw se;
@@ -134,28 +137,28 @@ public class Server{
                 byte[] copy = Arrays.copyOf(packet.getData(), packet.getLength());
                 InetAddress srcAddr = packet.getAddress();
                 int srcPort = packet.getPort();
-                System.out.println("[SERVER] - Received packet from " + srcAddr + ":" + srcPort + " with length " + copy.length);
-                System.out.println("[UDP] - Submitting work to workerPool for " + srcAddr + ":" + srcPort);
+                logger.fine("[SERVER] - Received packet from " + srcAddr + ":" + srcPort + " with length " + copy.length);
+                logger.fine("[UDP] - Submitting work to workerPool for " + srcAddr + ":" + srcPort);
                 try {
                     workerPool.submit(() -> {
-                        System.out.println("[UDP] - Worker start for " + srcAddr + ":" + srcPort + " on thread " + Thread.currentThread().getName());
+                        logger.fine("[UDP] - Worker start for " + srcAddr + ":" + srcPort + " on thread " + Thread.currentThread().getName());
                         try {
                             processPacket(copy, srcAddr, srcPort);
                         } catch (Exception e) {
-                            System.err.println("[UDP] - Worker caught exception while processing packet from " + srcAddr + ":" + srcPort + " -> " + e);
+                            logger.log(Level.WARNING, "[UDP] - Worker caught exception while processing packet from " + srcAddr + ":" + srcPort, e);
                         }
                     });
                 } catch (java.util.concurrent.RejectedExecutionException rex) {
-                    System.err.println("[UDP] - Task submission rejected: " + rex);
+                    logger.log(Level.WARNING, "[UDP] - Task submission rejected", rex);
                 }
             }
         } finally {
-            System.out.println("[UDP] - udpReceive exiting");
+            logger.info("[UDP] - udpReceive exiting");
         }
     }
 
     public void stop() {
-        System.out.println("[SERVER] - Stopping server...");
+    logger.info("[SERVER] - Stopping server...");
         // close tcp acceptor first so accept loop can exit
         try {
             if (tcpServerSocket != null && !tcpServerSocket.isClosed()) tcpServerSocket.close();
@@ -185,19 +188,19 @@ public class Server{
         tcpClients.forEach(s -> { try { s.close(); } catch (IOException ignored) {} });
         tcpClients.clear();
         tcpSocketToClientId.clear();
-        System.out.println("[SERVER] - Stopped");
+        logger.info("[SERVER] - Stopped");
     }
 
 
     public void tcpConnection() throws Exception{
-        tcpServerSocket = new ServerSocket(4444);
-        System.out.println("[TCP] - Listening for TCP clients on port 4444");
+    tcpServerSocket = new ServerSocket(4444);
+    logger.info("[TCP] - Listening for TCP clients on port 4444");
 
         try {
             while (!tcpServerSocket.isClosed()) {
                 try {
                     Socket tcpSocket = tcpServerSocket.accept(); // blocking
-                    System.out.println("[TCP] - Accepted connection from " + tcpSocket.getRemoteSocketAddress());
+                    logger.info("[TCP] - Accepted connection from " + tcpSocket.getRemoteSocketAddress());
 
                     // add to tcpClients list
                     tcpClients.add(tcpSocket);
@@ -211,9 +214,9 @@ public class Server{
                 } catch (SocketException se) {
                     // server socket was closed, break out
                     if (tcpServerSocket.isClosed()) break;
-                    System.out.println("[SERVER] - TCP accept SocketException: " + se.getMessage());
+                    logger.log(Level.WARNING, "[SERVER] - TCP accept SocketException", se);
                 } catch (IOException e) {
-                    System.out.println("[SERVER] - TCP accept error: " + e.getMessage());
+                    logger.log(Level.WARNING, "[SERVER] - TCP accept error", e);
                 }
             }
         } finally { // gracefully close server socket
@@ -277,23 +280,38 @@ public class Server{
                 // Reply with the assigned client id so client knows it
                 writer.write("OK " + clientId + "\n");
                 writer.flush();
-                System.out.println("[TCP] - Registered clientId=" + clientId + " udpPort=" + udpPort + " from " + tcpSocket.getRemoteSocketAddress());
+                logger.info("[TCP] - Registered clientId=" + clientId + " udpPort=" + udpPort + " from " + tcpSocket.getRemoteSocketAddress());
 
-                // handle subsequent commands from this client until disconnect
+                // handle commands from this client until disconnect
+                // make the control socket read interrupt-friendly by using a SO_TIMEOUT
+                try {
+                    tcpSocket.setSoTimeout(2000); // 2s timeout so we can check interrupted/shutdown
+                } catch (Exception e) {
+                    logger.log(Level.FINE, "Failed to set SO_TIMEOUT on control socket", e);
+                }
+
                 String line;
-                while ((line = reader.readLine()) != null) {
-                    System.out.println("[TCP] - Received command from " + clientId + ": " + line);
+                while (!Thread.currentThread().isInterrupted()) {
                     try {
-                        handleCommands(line.trim(), clientId);
-                    } catch (Exception e) {
-                        System.err.println("[TCP] - Error handling command from " + clientId + " -> " + e);
+                        line = reader.readLine();
+                        if (line == null) break; // client closed
+                        logger.fine("[TCP] - Received command from " + clientId + ": " + line);
+                        try {
+                            handleCommands(line.trim(), clientId);
+                        } catch (Exception e) {
+                            logger.log(Level.WARNING, "[TCP] - Error handling command from " + clientId, e);
+                        }
+                    } catch (java.net.SocketTimeoutException ste) {
+                        // timeout periodically so we can respond to interrupts/shutdown
+                        if (Thread.currentThread().isInterrupted()) break;
+                        continue;
                     }
                 }
 
             } catch (IOException e) {
                 System.out.println("[TCP] - ControlHandler IO error: " + e.getMessage());
             } finally {
-                // cleanup on disconnect: mark associated client as DISCONNECTED rather than immediate removal
+                // cleanup on disconnect
                 Integer removed = tcpSocketToClientId.remove(tcpSocket);
                 if (removed != null) {
                     ClientState st = clientStates.get(removed);
