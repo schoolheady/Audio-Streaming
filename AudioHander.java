@@ -1,12 +1,17 @@
-import java.sound.sampled.*;
+import java.io.ByteArrayOutputStream;
+import java.io.InterruptedIOException;
 import java.net.*;
-import java.io.*;
-import java.util.*;
-import java.nio.*;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.TreeMap;
+import javax.sound.sampled.*;
+import java.io.IOException;
 
-public class AudioHander{
+public class AudioHandler {
+    private final InetAddress serverAddress;
     private final int UDP_PORT;
-    private final InetAdress serverAddress;
     private final int CLIENT_ID;
     private final AtomicBoolean isMute;
 
@@ -14,157 +19,254 @@ public class AudioHander{
     private static final int SAMPLE_SIZE_IN_BITS = 16;
     private static final int CHANNELS = 1;
     private static final boolean SIGNED = true;
-    private static final boolean BIG_ENDIAN = false;
-    private static final int BUFFER_SIZE = 512;
+    private static final boolean BIG_ENDIAN = false; // Audio format is set to Little-Endian
+    private static final int BUFFER_SIZE = 320; // 20ms of audio (8000 * 0.02 * 2 bytes/sample)
 
-    private AudioFormat audioFormat;
-    private Thread sendThread , receiveThread;
+    private AudioFormat format;
+    private Thread sendThread, receiveThread, playbackThread;
     private volatile boolean isRunning = true;
-
-    private final ConcurrentHashMap<Integer, BlockingQueue<byte[]>> jitterBuffers = new ConcurrentHashMap<>();
+    
+    // Use a single bound DatagramSocket for both sending and receiving
+    private final DatagramSocket socket; 
+    
+    // Use ConcurrentSkipListMap for thread-safe, sorted Jitter Buffer by Sequence Number
+    private final ConcurrentHashMap<Integer, ConcurrentSkipListMap<Long, byte[]>> jitterBuffers = new ConcurrentHashMap<>();
     private SourceDataLine speakers;
 
-    public AudioHandler(InetAdress serverAddress , int UDP_PORT , int CLIENT_ID , AtomicBoolean isMute) throws LineUnvailibleException{
-        this.UDP_PORT = UDP_PORT ;
+    public AudioHandler(InetAddress serverAddress, int UDP_PORT, int CLIENT_ID, AtomicBoolean isMute) throws LineUnavailableException, SocketException {
+        this.UDP_PORT = UDP_PORT;
         this.serverAddress = serverAddress;
         this.CLIENT_ID = CLIENT_ID;
         this.isMute = isMute;
 
-        fomat = new AudioFormat(SAMPLE_RATE , SAMPLE_SIZE_IN_BITS , CHANNELS , SIGNED , BIG_ENDIAN);
-        DataLine.Info info = new DataLine.Info(SourceDataLine.class , format);
+        // 1. Create a single DatagramSocket, bound to the specified port (or any available port if UDP_PORT=0)
+        this.socket = new DatagramSocket(this.UDP_PORT); 
+
+        format = new AudioFormat(SAMPLE_RATE, SAMPLE_SIZE_IN_BITS, CHANNELS, SIGNED, BIG_ENDIAN);
+        DataLine.Info info = new DataLine.Info(SourceDataLine.class, format);
         speakers = (SourceDataLine) AudioSystem.getLine(info);
         speakers.open(format);
         speakers.start();
     }
+    
+    // Method to get the local port for the REGISTER command
+    public int getLocalPort() {
+        return socket.getLocalPort();
+    }
 
-    public void startStreaming(){
+    public void startStreaming() {
         isRunning = true;
-        sendThread = new Thread(this::streamAudio, "AudioSender");
+        sendThread = new Thread(this::audioSender, "AudioSender");
         sendThread.start();
     }
 
-    public void startReceiving(){
-       receiveThread = new Thread(this::audioReceiver, "AudioReceiver");
-       receiveThread.start();
-       new Thread(this::playAudio, "AudioPlayer").start();
+    public void startReceiving() {
+        receiveThread = new Thread(this::audioReceiver, "AudioReceiver");
+        receiveThread.start();
+        playbackThread = new Thread(this::audioPlayback, "AudioPlayer");
+        playbackThread.start();
     }
 
-    public void stopStreaming(){
+    public void stopStreaming() {
         isRunning = false;
-        if(sendThread != null){
-            try{
+        if (sendThread != null) {
+            try {
                 sendThread.join();
-            }catch(InterruptedException e){
+            } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
     }
 
-    public void stopReceiving(){
+    public void stopReceiving() {
         isRunning = false;
-        if(receiveThread != null){
-            try{
+        if (receiveThread != null) {
+            try {
                 receiveThread.join();
-            }catch(InterruptedException e){
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        if(playbackThread != null){
+             try {
+                playbackThread.join();
+            } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
         speakers.drain();
         speakers.close();
+        if (socket != null && !socket.isClosed()) {
+            socket.close();
+        }
     }
 
-    private void AudioSender(){
-        try(DataGramSocket socket = new DataGramSocket()){
-            DataLine.Info mic = new DataLine.Info(TargetDataLine.class , format);
+    // AudioSender is modified to adhere to the UDP header structure and mute logic
+    private void audioSender() {
+        try { 
+            DataLine.Info mic = new DataLine.Info(TargetDataLine.class, format);
             TargetDataLine microphone = (TargetDataLine) AudioSystem.getLine(mic);
             microphone.open(format);
             microphone.start();
 
             byte[] buffer = new byte[BUFFER_SIZE];
-            long squenceNumber = 0;
+            // Sequence number is int (4 bytes) starting at 0
+            int sequenceNumber = 0; 
+            long lastSendTime = System.currentTimeMillis();
 
-            if(isMute){
-                int bytesRead = microphone.read(buffer , 0 , buffer.length);
-                if(bytesRead > 0){
-                    ByteArrayOutputStream packetData = new ByteArrayOutputStream();
-                    packetData.write(ByteBuffer.allocate(4).putInt(CLIENT_ID).array());
-                    packetData.write(ByteBuffer.allocate(8).putLong(squenceNumber).array());
-                    packetData.write(buffer , 0 , bytesRead);
+            while (isRunning) {
+                final int FRAME_DURATION_MS = (int)(BUFFER_SIZE * 1000 / (SAMPLE_RATE * SAMPLE_SIZE_IN_BITS/8)); // ~20ms
+                
+                // Mute/Unmute logic check
+                if (!isMute.get()) { 
+                    int bytesRead = microphone.read(buffer, 0, buffer.length);
+                    
+                    if (bytesRead > 0) {
+                        // UDP Header: 4 bytes clientId (int), 4 bytes sequenceNumber (int), 2 bytes audioLength (short)
+                        // Total 10 bytes header, must be BIG-ENDIAN
+                        
+                        // Use ByteBuffer to pack the header in Big-Endian
+                        ByteBuffer headerBuffer = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN);
+                        headerBuffer.putInt(CLIENT_ID); // 4 bytes clientId
+                        headerBuffer.putInt(sequenceNumber); // 4 bytes sequenceNumber (int32)
+                        headerBuffer.putShort((short) bytesRead); // 2 bytes audioLength (uint16)
+                        
+                        ByteArrayOutputStream packetData = new ByteArrayOutputStream();
+                        packetData.write(headerBuffer.array());
+                        packetData.write(buffer, 0, bytesRead); // Audio payload
 
-                    byte[] datasend = packetData.toByteArray();
-                    DatagramPacket packet = new DatagramPacket(datasend , datasend.length , serverAddress , UDP_PORT);
-                    socket.send(packet);
+                        byte[] datasend = packetData.toByteArray();
+                        DatagramPacket packet = new DatagramPacket(datasend, datasend.length, serverAddress, UDP_PORT);
+                        socket.send(packet);
+                        
+                        sequenceNumber = (sequenceNumber + 1); // Increment sequence number
+                        lastSendTime = System.currentTimeMillis();
+                    }
+                } else {
+                    // NAT Keepalive Logic: Send a packet every 15-30s if idle (Mute)
+                    if (System.currentTimeMillis() - lastSendTime > 15000) { // 15 seconds
+                         // Send a keepalive packet (header only, audioLength = 0)
+                        ByteBuffer headerBuffer = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN);
+                        headerBuffer.putInt(CLIENT_ID);
+                        headerBuffer.putInt(sequenceNumber);
+                        headerBuffer.putShort((short) 0); // audioLength = 0
+                        
+                        byte[] datasend = headerBuffer.array();
+                        DatagramPacket packet = new DatagramPacket(datasend, datasend.length, serverAddress, UDP_PORT);
+                        socket.send(packet);
+                        
+                        sequenceNumber = (sequenceNumber + 1);
+                        lastSendTime = System.currentTimeMillis();
+                        System.out.println("Sent NAT Keepalive packet.");
+                    }
+                    try {
+                        Thread.sleep(FRAME_DURATION_MS); 
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
                 }
-            }
-            else{
-                Thread.sleep(10);
             }
             microphone.stop();
             microphone.close();
-        }catch(Exception e){
-            if(isRunning){
-                System.out.println("Error in AudioSender: " + e.getMessage());
+        } catch (Exception e) {
+            if (isRunning) {
+                System.err.println("Error in AudioSender: " + e.getMessage());
                 e.printStackTrace();
             }
         }
     }
 
-    // Receive audio packets from server
-    private void audioReceiver(){
-        try(DataGramSocket socket = new DataGramSocket(UDP_PORT)){
-            byte[] buffer = new byte[BUFFER_SIZE + 12]; // 4 bytes for clientId, 8 bytes for sequence number
-            while(isRunning){
-                DatagramPacket packet = new DatagramPacket(buffer , buffer.length);
-                socket.receive(packet);
+    // audioReceiver is modified to unpack the 10-byte header and use TreeMap
+    private void audioReceiver() {
+        byte[] buffer = new byte[65535]; 
+        while (isRunning) {
+            try {
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                socket.receive(packet); // Use the created socket
 
-                ByteBuffer byteBuffer = ByteBuffer.wrap(packet.getData() , 0 , packet.getLength());
-                int senderId = byteBuffer.getInt();
-                long sequenceNumber = byteBuffer.getLong();
-                byte[] audioData = new byte[packet.getLength() - 12];
-                byteBuffer.get(audioData);
+                if (packet.getLength() < 10) { // Packet must have at least 10 bytes of header
+                    System.out.println("Dropping malformed packet: length too small.");
+                    continue; 
+                }
 
-                jitterBuffers.putIfAbsent(senderId , new LinkedBlockingQueue<>());
-                BlockingQueue<byte[]> queue = jitterBuffers.get(senderId);
-                if(queue.size() < 50){ // Limit jitter buffer size
-                    queue.offer(audioData);
+                // Unpack the Big-Endian header
+                ByteBuffer byteBuffer = ByteBuffer.wrap(packet.getData(), 0, packet.getLength())
+                                                .order(ByteOrder.BIG_ENDIAN);
+                
+                int senderId = byteBuffer.getInt(); // 4 bytes clientId
+                // Read int (4 bytes) and convert to Long to treat as unsigned int for sequence number
+                long sequenceNumber = byteBuffer.getInt() & 0xFFFFFFFFL; 
+                int audioLength = byteBuffer.getShort() & 0xFFFF; // 2 bytes audioLength (unsigned short)
+                
+                // Validate packet length
+                if (audioLength > BUFFER_SIZE || audioLength < 0 || packet.getLength() != 10 + audioLength) {
+                    System.out.println("Dropping malformed packet: invalid audioLength or packet size.");
+                    continue;
+                }
+                
+                // If audioLength = 0, ignore (might be a keepalive packet)
+                if(audioLength == 0) continue;
+                
+                byte[] audioData = new byte[audioLength];
+                byteBuffer.get(audioData); // Payload
+
+                // Use ConcurrentSkipListMap for the Jitter Buffer (ordered by sequence number)
+                jitterBuffers.putIfAbsent(senderId, new ConcurrentSkipListMap<>());
+                ConcurrentSkipListMap<Long, byte[]> queue = jitterBuffers.get(senderId);
+                
+                if (queue.size() < 200) { // Cap Jitter Buffer size (e.g., 200 frames)
+                    queue.put(sequenceNumber, audioData); 
+                }
+            } catch (SocketTimeoutException | InterruptedIOException ignore) {
+                // Ignore timeouts/interrupts
+            } catch (Exception e) {
+                if (isRunning) {
+                    System.err.println("Error in AudioReceiver: " + e.getMessage());
+                    e.printStackTrace();
                 }
             }
-        }catch(Exception e){
-            if(isRunning){
-                System.out.println("Error in AudioReceiver: " + e.getMessage());
-                e.printStackTrace();
-            }
         }
     }
 
-    // Play audio from jitter buffers
-    private void audioPlayback(){
-        final int PLAYBACK_INTERVAL_MS = 20;
+    // audioPlayback is modified to retrieve packets in order from the TreeMap
+    private void audioPlayback() {
+        // ~20ms playback interval
+        final int PLAYBACK_INTERVAL_MS = (int)(BUFFER_SIZE * 1000 / (SAMPLE_RATE * SAMPLE_SIZE_IN_BITS/8)); 
+        final int JITTER_THRESHOLD = 2; // Start playing when at least 2 packets are in the buffer
         
-        while(isRunning){
-            boolean plaing = false;
+        while (isRunning) {
+            boolean played = false;
 
-            for(BlockingQueue<byte[]>buffer : jitterBuffers.values()){
-                try{
-                    if(buffer.size( >= PLAYBACK_INTERVAL_MS || plaing)){
-                        byte[] audioData = buffer.poll();
-                        if(audioData != null){
-                            speakers.write(audioData, 0 , audioData.length);
-                            playing = true;
+            // Iterate through all client buffers
+            for (ConcurrentSkipListMap<Long, byte[]> buffer : jitterBuffers.values()) {
+                try {
+                    // Jitter Threshold: only play if there are enough packets
+                    if (buffer.size() >= JITTER_THRESHOLD) {
+                        // Get and remove the packet with the lowest sequenceNumber (the oldest)
+                        Long oldestKey = buffer.firstKey();
+                        byte[] audioData = buffer.remove(oldestKey); 
+                        
+                        if (audioData != null) {
+                            speakers.write(audioData, 0, audioData.length);
+                            played = true;
                         }
                     }
-                }catch(Exception e){
-                    System.out.println("Error in AudioPlayer: " + e.getMessage());
+                } catch (Exception e) {
+                    System.err.println("Error in AudioPlayer: " + e.getMessage());
                 }
             }
-            if(!playing){
-                try{
-                    Thread.sleep(10);
-                }catch(InterruptedException e){
+            
+            // Sleep to regulate playback speed
+            if (!played) { 
+                try {
+                    // Sleep for the frame duration if nothing was played
+                    Thread.sleep(PLAYBACK_INTERVAL_MS); 
+                } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
                 }
-        }
+            }
         }
         speakers.stop();
         speakers.close();
