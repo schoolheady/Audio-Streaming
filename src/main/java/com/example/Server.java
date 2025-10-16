@@ -10,6 +10,8 @@ import java.net.*;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
@@ -19,9 +21,7 @@ import java.util.concurrent.Executors;
 public class Server{
     private final DatagramSocket socket; 
 
-    // store connected clients with tcp
-    private static final List<Socket> tcpClients = new ArrayList<>();
-    // mapping from TCP socket 
+    private static final CopyOnWriteArrayList<Socket> tcpClients = new CopyOnWriteArrayList<>();
     private final ConcurrentHashMap<Socket, Integer> tcpSocketToClientId = new ConcurrentHashMap<>();
 
     private final ExecutorService workerPool = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
@@ -30,11 +30,16 @@ public class Server{
     // server-assigned client id generator
     private final java.util.concurrent.atomic.AtomicInteger nextClientId = new java.util.concurrent.atomic.AtomicInteger(1);
     private static final int MAX_PACKET_SIZE = 1500;
+    private static final int MAX_BUFFERED_PACKETS = 200; // per-client buffer cap
 
-    // heartbeat and timeouts
     private final java.util.concurrent.ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private static final long HEARTBEAT_INTERVAL_MS = 2_000; // 2s
     static final long CLIENT_TIMEOUT_MS = 10_000; // 10s without packets -> DISCONNECTED
+    // removal after extended grace period (5x timeout)
+    private static final long CLIENT_REMOVAL_MS = CLIENT_TIMEOUT_MS * 5;
+
+    // tcp acceptor socket
+    private ServerSocket tcpServerSocket;
 
     public Server(DatagramSocket socket) throws Exception{
         this.clientStates = new ConcurrentHashMap<>();
@@ -43,8 +48,7 @@ public class Server{
 
 
     public void startTCPServer() throws Exception{
-        System.out.println("[SERVER] - Server started");
-        // start TCP accept loop in background 
+    System.out.println("[SERVER] - Server started");
         new Thread(() -> {
             try {
                 tcpConnection();
@@ -53,7 +57,6 @@ public class Server{
             }
         }, "tcp-accept-thread").start();
 
-        // start heartbeat scheduler 
         scheduler.scheduleAtFixedRate(() -> {
             try {
                 heartbeat();
@@ -65,8 +68,10 @@ public class Server{
     }
 
     public void heartbeat() throws Exception{
-        long now = System.currentTimeMillis();
-        for (ClientState st : clientStates.values()) {
+    long now = System.currentTimeMillis();
+        for (Map.Entry<Integer, ClientState> e : clientStates.entrySet()) {
+            Integer id = e.getKey();
+            ClientState st = e.getValue();
             if (st == null) continue;
             synchronized (st) {
                 if (st.lastHeard > 0 && now - st.lastHeard > CLIENT_TIMEOUT_MS) {
@@ -75,15 +80,17 @@ public class Server{
                         st.status = ClientStatus.DISCONNECTED;
                     }
                 }
+
+                if (st.status == ClientStatus.DISCONNECTED && now - st.lastHeard > CLIENT_REMOVAL_MS) {
+                    System.out.println("[HEARTBEAT] - Removing stale clientId=" + id + " after grace period");
+                    clientStates.remove(id);
+                    tcpSocketToClientId.values().removeIf(v -> v.equals(id));
+                }
             }
         }
 
-        // attempt light TCP ping to detect closed sockets and remove them
-        List<Socket> snapshot;
-        synchronized (tcpClients) {
-            snapshot = new ArrayList<>(tcpClients);
-        }
-        
+    List<Socket> snapshot = new ArrayList<>(tcpClients);
+
         for (Socket client : snapshot) {
             try {
                 // Send a heartbeat message to the client to detect closed connections
@@ -102,12 +109,11 @@ public class Server{
                     }
                 }
                 try { client.close(); } catch (IOException ignored) {}
-                synchronized (tcpClients) { tcpClients.remove(client); }
+                tcpClients.remove(client);
             }
         }
     }
 
-    // function that receives packages from client and sends it to other clients except origin (UDP)
     public void udpReceive() throws Exception{ 
         try {
             while (!Thread.currentThread().isInterrupted() && !socket.isClosed()) {
@@ -150,51 +156,71 @@ public class Server{
 
     public void stop() {
         System.out.println("[SERVER] - Stopping server...");
+        // close tcp acceptor first so accept loop can exit
+        try {
+            if (tcpServerSocket != null && !tcpServerSocket.isClosed()) tcpServerSocket.close();
+        } catch (Exception ignored) {}
         try {
             if (socket != null && !socket.isClosed()) socket.close();
         } catch (Exception e) {
             // ignore
         }
         try {
+            scheduler.shutdownNow();
+        } catch (Exception ignored) {}
+
+        try {
             workerPool.shutdownNow();
-        } catch (Exception e) {
-            // ignore
+        } catch (Exception ignored) {}
+
+        try {
+            // wait a short time for shutdown
+            scheduler.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS);
+            workerPool.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
         }
+
+        // clear tcp client references
+        tcpClients.forEach(s -> { try { s.close(); } catch (IOException ignored) {} });
+        tcpClients.clear();
+        tcpSocketToClientId.clear();
         System.out.println("[SERVER] - Stopped");
     }
 
 
-    // users need to connect through TCP first before sending/receiving UDP packages
     public void tcpConnection() throws Exception{
-        try (ServerSocket server = new ServerSocket(4444)) {
+        tcpServerSocket = new ServerSocket(4444);
         System.out.println("[TCP] - Listening for TCP clients on port 4444");
 
-        while (true) {
-            try {
-                Socket tcpSocket = server.accept(); // blocking
-                System.out.println("[TCP] - Accepted connection from " + tcpSocket.getRemoteSocketAddress());
+        try {
+            while (!tcpServerSocket.isClosed()) {
+                try {
+                    Socket tcpSocket = tcpServerSocket.accept(); // blocking
+                    System.out.println("[TCP] - Accepted connection from " + tcpSocket.getRemoteSocketAddress());
 
-                // add to tcpClients list
-                synchronized (tcpClients) {
+                    // add to tcpClients list
                     tcpClients.add(tcpSocket);
+
+                    // spawn a control handler for this socket and return immediately to accept more
+                    ControlHandler handler = new ControlHandler(tcpSocket);
+                    Thread t = new Thread(handler, "control-handler-" + tcpSocket.getPort());
+                    t.setDaemon(true);
+                    t.start();
+
+                } catch (SocketException se) {
+                    // server socket was closed, break out
+                    if (tcpServerSocket.isClosed()) break;
+                    System.out.println("[SERVER] - TCP accept SocketException: " + se.getMessage());
+                } catch (IOException e) {
+                    System.out.println("[SERVER] - TCP accept error: " + e.getMessage());
                 }
-
-                // spawn a control handler for this socket and return immediately to accept more
-                ControlHandler handler = new ControlHandler(tcpSocket);
-                Thread t = new Thread(handler, "control-handler-" + tcpSocket.getPort());
-                t.setDaemon(true);
-                t.start();
-
-            } catch (IOException e) {
-                System.out.println("[SERVER] - TCP accept error: " + e.getMessage());
             }
+        } finally { // gracefully close server socket
+            try { if (tcpServerSocket != null && !tcpServerSocket.isClosed()) tcpServerSocket.close(); } catch (IOException ignored) {}
         }
-        } // try-with-resources server
     }
 
-    /**
-     * Per-client control handler: reads REGISTER and subsequent commands.
-     */
     private class ControlHandler implements Runnable {
         private final Socket tcpSocket;
 
@@ -203,6 +229,7 @@ public class Server{
         }
 
         @Override
+        // handle registration and subsequent commands from this client
         public void run() {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(tcpSocket.getInputStream(), java.nio.charset.StandardCharsets.UTF_8));
                  BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(tcpSocket.getOutputStream(), java.nio.charset.StandardCharsets.UTF_8))) {
@@ -216,43 +243,25 @@ public class Server{
                     return;
                 }
 
-                String[] parts = reg.split("\\s+");
-                Integer clientId = null;
+                String[] parts = reg.trim().split("\\s+");
                 int udpPort;
                 try {
-                    // Support two forms:
-                    // 1) REGISTER <udpPort>
-                    // 2) REGISTER <clientId> <udpPort>  (deprecated; server will validate)
-                    if (parts.length == 2) {
-                        udpPort = Integer.parseInt(parts[1]);
-                    } else if (parts.length >= 3) {
-                        // try parse client-provided id, but do not trust it - only accept if free
-                        try {
-                            int requested = Integer.parseInt(parts[1]);
-                            udpPort = Integer.parseInt(parts[2]);
-                            // accept requested id only if not already in use
-                            if (!clientStates.containsKey(requested)) {
-                                clientId = requested;
-                            }
-                        } catch (NumberFormatException nfe) {
-                            // fallthrough: assign id
-                            udpPort = Integer.parseInt(parts[1]);
-                        }
-                    } else {
+                    if (parts.length != 2) {
                         writer.write("ERROR invalid register\n");
                         writer.flush();
                         try { tcpSocket.close(); } catch (IOException ignored) {}
                         return;
                     }
-                } catch (NumberFormatException | ArrayIndexOutOfBoundsException ex) {
+                    udpPort = Integer.parseInt(parts[1]);
+                } catch (NumberFormatException ex) {
                     writer.write("ERROR invalid register\n");
                     writer.flush();
                     try { tcpSocket.close(); } catch (IOException ignored) {}
                     return;
                 }
 
-                // assign server id if not set
-                if (clientId == null) clientId = nextClientId.getAndIncrement();
+                // assign server id 
+                Integer clientId = nextClientId.getAndIncrement();
 
                 // map tcp socket to client id
                 tcpSocketToClientId.put(tcpSocket, clientId);
@@ -293,14 +302,12 @@ public class Server{
                     }
                 }
                 try { tcpSocket.close(); } catch (IOException ignored) {}
-                synchronized (tcpClients) { tcpClients.remove(tcpSocket); }
+                tcpClients.remove(tcpSocket);
                 System.out.println("[TCP] - ControlHandler exiting for " + tcpSocket.getRemoteSocketAddress());
             }
         }
     }
 
-    // receiveTCP removed (unused). ControlHandler reads directly from socket streams.
-    // all clients need a state
     void handleCommands(String command, int clientId) throws Exception{
         ClientState st = clientStates.get(clientId);
         if (st == null) {
@@ -309,43 +316,34 @@ public class Server{
         }
 
         switch (command) {
-            case "MUTE":
-                synchronized (st) { st.status = ClientStatus.MUTED; }
+            case "MUTE" -> {
+                synchronized (st) {
+                    st.status = ClientStatus.MUTED;
+                }
                 System.out.println("[TCP] - Client " + clientId + " muted");
-                break;
-            case "LEAVE":
-                synchronized (st) { st.status = ClientStatus.LEFT; }
+            }
+            case "LEAVE" -> {
+                synchronized (st) {
+                    st.status = ClientStatus.LEFT;
+                }
                 // remove mapping to tcp socket (if any) and client state
                 tcpSocketToClientId.values().removeIf(id -> id == clientId);
                 clientStates.remove(clientId);
                 System.out.println("[TCP] - Client " + clientId + " left and unregistered");
-                break;
-            case "JOIN":
-                synchronized (st) { st.status = ClientStatus.ACTIVE; }
+            }
+            case "JOIN" -> {
+                synchronized (st) {
+                    st.status = ClientStatus.ACTIVE;
+                }
                 System.out.println("[TCP] - Client " + clientId + " joined (ACTIVE)");
-                break;
-            default:
-                System.out.println("[SERVER] - Unknown command: " + command);
-                break;
+            }
+            default -> System.out.println("[SERVER] - Unknown command: " + command);
         }
-        // handle server commands from clients
-        // mute
-        // leave
-        // join
+    // handle server commands from clients (mute/leave/join handled above)
 
     }
 
-    private void mute() throws Exception{
-        // mute a client (TCP)
-    }
-    private void leave() throws Exception{
-        // leave a client (TCP)
-        // remove from tcpClients and clientStates
-    }
-    private void join() throws Exception{
-        // join a client (TCP)
-
-    }
+    // helper methods removed — command handling is done in handleCommands()
     
     public void processPacket(byte[] data, InetAddress srcAddr, int srcPort) throws Exception {
         System.out.println("[PROCESS] - Enter processPacket: src=" + srcAddr + ":" + srcPort + " size=" + (data==null?0:data.length));
@@ -395,9 +393,14 @@ public class Server{
             state.lastHeard = System.currentTimeMillis();
             state.clientId = audioPacket.clientId;
 
-            // Add packet to buffer
+            // Add packet to buffer with cap eviction (drop oldest)
             System.out.println("[PROCESS] - Buffering packet seq=" + audioPacket.sequenceNumber + " for client=" + audioPacket.clientId);
             state.buffer.put(audioPacket.sequenceNumber, audioPacket);
+            while (state.buffer.size() > MAX_BUFFERED_PACKETS) {
+                Integer firstKey = state.buffer.firstKey();
+                state.buffer.remove(firstKey);
+                System.out.println("[PROCESS] - Evicted oldest buffered packet seq=" + firstKey + " for client=" + state.clientId);
+            }
 
             // Process in-order packets starting from expectedSeq
             List<AudioPacket> toSend = new ArrayList<>();
@@ -449,34 +452,50 @@ public class Server{
     }
 
 
-    // 1 byte client ID 4 bytes sequence number 2 bytes audio data length 320 bytes audio data
+    // 4 byte client ID, 4 bytes sequence number, 2 bytes audio data length, then audio bytes
     AudioPacket deserializeAudioPacket(byte[] data) {
-        int clientId = data[0] & 0xFF; // ensure unsigned
-        int sequenceNumber = ((data[1] & 0xFF) << 24)
-                        |    ((data[2] & 0xFF) << 16)
-                        |    ((data[3] & 0xFF) << 8)
-                        |    (data[4] & 0xFF);
-        int audioDataLength = ((data[5] & 0xFF) << 8) | (data[6] & 0xFF);
-        
-        // safety check
-        if (audioDataLength > data.length - 7) {
+        final int HEADER_SIZE = 10; // 4 (clientId) + 4 (seq) + 2 (len)
+        if (data == null || data.length < HEADER_SIZE) {
+            throw new IllegalArgumentException("Packet too short for header");
+        }
+
+        int clientId = ((data[0] & 0xFF) << 24)
+                     | ((data[1] & 0xFF) << 16)
+                     | ((data[2] & 0xFF) << 8)
+                     | (data[3] & 0xFF);
+
+        int sequenceNumber = ((data[4] & 0xFF) << 24)
+                        |    ((data[5] & 0xFF) << 16)
+                        |    ((data[6] & 0xFF) << 8)
+                        |    (data[7] & 0xFF);
+
+        int audioDataLength = ((data[8] & 0xFF) << 8) | (data[9] & 0xFF);
+
+        if (audioDataLength < 0 || audioDataLength > data.length - HEADER_SIZE) {
             throw new IllegalArgumentException("Audio data length exceeds packet size");
         }
 
-        byte[] audioData = Arrays.copyOfRange(data, 7, 7 + audioDataLength);
+        byte[] audioData = Arrays.copyOfRange(data, HEADER_SIZE, HEADER_SIZE + audioDataLength);
         return new AudioPacket(clientId, sequenceNumber, audioData);
     }
 
     byte[] serializeAudioPacket(AudioPacket pkt) {
-        byte[] data = new byte[7 + pkt.audioData.length];
-        data[0] = (byte) pkt.clientId;
-        data[1] = (byte) (pkt.sequenceNumber >> 24);
-        data[2] = (byte) (pkt.sequenceNumber >> 16);
-        data[3] = (byte) (pkt.sequenceNumber >> 8);
-        data[4] = (byte) pkt.sequenceNumber;
-        data[5] = (byte) (pkt.audioData.length >> 8);
-        data[6] = (byte) pkt.audioData.length;
-        System.arraycopy(pkt.audioData, 0, data, 7, pkt.audioData.length);
+        final int HEADER_SIZE = 10;
+        byte[] data = new byte[HEADER_SIZE + pkt.audioData.length];
+        data[0] = (byte) (pkt.clientId >> 24);
+        data[1] = (byte) (pkt.clientId >> 16);
+        data[2] = (byte) (pkt.clientId >> 8);
+        data[3] = (byte) pkt.clientId;
+
+        data[4] = (byte) (pkt.sequenceNumber >> 24);
+        data[5] = (byte) (pkt.sequenceNumber >> 16);
+        data[6] = (byte) (pkt.sequenceNumber >> 8);
+        data[7] = (byte) pkt.sequenceNumber;
+
+        data[8] = (byte) (pkt.audioData.length >> 8);
+        data[9] = (byte) pkt.audioData.length;
+
+        System.arraycopy(pkt.audioData, 0, data, HEADER_SIZE, pkt.audioData.length);
         return data;
     }
 
