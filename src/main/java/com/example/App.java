@@ -1,10 +1,17 @@
 package com.example;
 
+import javax.swing.SwingUtilities;
+
 import java.net.DatagramSocket;
 import java.net.ServerSocket;
 
 
 public class App {
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> {
+            new AudioStreamingUI().showUI();
+        });
+    }
 
     public static void main(String[] args) throws Exception {
     String mode = (args != null && args.length > 0) ? args[0].trim().toLowerCase() : "client";
