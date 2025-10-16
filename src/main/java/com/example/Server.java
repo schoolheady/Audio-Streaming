@@ -51,23 +51,66 @@ public class Server{
 
 
     public void startTCPServer() throws Exception{
-    logger.info("[SERVER] - Server started");
+        // default binding to port 4444
+        startTCPServer(new ServerSocket(4444));
+    }
+
+    /**
+     * Start TCP acceptor using a pre-bound ServerSocket. This allows callers to bind to an
+     * ephemeral port and pass the socket in (useful for in-process local testing).
+     */
+    public void startTCPServer(ServerSocket providedSocket) throws Exception {
+        this.tcpServerSocket = providedSocket;
+        logger.info("[SERVER] - Server starting TCP acceptor");
+        logger.info("[TCP] - Listening for TCP clients on port " + tcpServerSocket.getLocalPort());
+
         new Thread(() -> {
             try {
-                tcpConnection();
+                tcpAcceptLoop();
             } catch (Exception e) {
                 logger.log(Level.SEVERE, "[TCP] - accept loop error", e);
             }
         }, "tcp-accept-thread").start();
 
         scheduler.scheduleAtFixedRate(() -> {
-                try {
+            try {
                 heartbeat();
             } catch (Exception e) {
                 logger.log(Level.WARNING, "[HEARTBEAT] - error", e);
             }
         }, HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
 
+    /**
+     * Accept loop that assumes tcpServerSocket is already created and bound.
+     */
+    private void tcpAcceptLoop() throws Exception {
+        try {
+            while (!tcpServerSocket.isClosed()) {
+                try {
+                    Socket tcpSocket = tcpServerSocket.accept(); // blocking
+                    logger.info("[TCP] - Accepted connection from " + tcpSocket.getRemoteSocketAddress());
+
+                    // add to tcpClients list
+                    tcpClients.add(tcpSocket);
+
+                    // spawn a control handler for this socket and return immediately to accept more
+                    ControlHandler handler = new ControlHandler(tcpSocket);
+                    Thread t = new Thread(handler, "control-handler-" + tcpSocket.getPort());
+                    t.setDaemon(true);
+                    t.start();
+
+                } catch (SocketException se) {
+                    // server socket was closed, break out
+                    if (tcpServerSocket.isClosed()) break;
+                    logger.log(Level.WARNING, "[SERVER] - TCP accept SocketException", se);
+                } catch (IOException e) {
+                    logger.log(Level.WARNING, "[SERVER] - TCP accept error", e);
+                }
+            }
+        } finally {
+            try { if (tcpServerSocket != null && !tcpServerSocket.isClosed()) tcpServerSocket.close(); } catch (IOException ignored) {}
+        }
     }
 
     public void heartbeat() throws Exception{

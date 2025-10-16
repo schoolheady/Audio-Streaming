@@ -1,80 +1,83 @@
 package com.example;
 
-import java.net.DatagramPacket;
 import java.net.DatagramSocket;
-import java.net.InetAddress;
+import java.net.ServerSocket;
+
 
 public class App {
 
     public static void main(String[] args) throws Exception {
-        // Start server bound to port 5555
-        DatagramSocket serverSocket = new DatagramSocket(5555);
-        Server server = new Server(serverSocket);
+    String mode = (args != null && args.length > 0) ? args[0].trim().toLowerCase() : "client";
 
-        // Start server UDP listener in background
-        new Thread(() -> {
+        if (mode.equals("server")) {
+            // Start server bound to port 5555
+            DatagramSocket serverSocket = new DatagramSocket(5555);
+            Server server = new Server(serverSocket);
+
+            // Start TCP control acceptor and UDP listener in background
+            // Start TCP control server so clients can REGISTER over TCP
+            server.startTCPServer();
+
+            // Start server UDP listener in background
+            Thread udpThread = new Thread(() -> {
+                try {
+                    server.udpReceive(); // runs indefinitely
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }, "server-udp-thread");
+            udpThread.setDaemon(true);
+            udpThread.start();
+
+            System.out.println("[MAIN] - Server running on UDP port 5555");
+
+            // Keep main thread alive until interrupted
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try {
+                    server.stop();
+                } catch (Exception ignored) {
+                }
+            }));
+
+            // Block main thread
+            synchronized (App.class) {
+                App.class.wait();
+            }
+
+        } else if (mode.equals("client")) {
+            // Run the simple VoiceChatClient main (it will handle user I/O)
+            VoiceChatClient.main(new String[0]);
+        } else if (mode.equals("local")) {
+            // Start server in this process (both TCP and UDP) and then launch a client that connects to it.
+            // Use an ephemeral UDP port for the server to avoid collisions with a system-wide 5555 listener.
+            DatagramSocket serverSocket = new DatagramSocket(0);
+            int serverUdpPort = serverSocket.getLocalPort();
+            Server server = new Server(serverSocket);
             try {
-                server.udpReceive(); // runs indefinitely
+                // bind TCP to an ephemeral port to avoid collisions with any existing server
+                ServerSocket tcpSocket = new ServerSocket(0);
+                int serverTcpPort = tcpSocket.getLocalPort();
+                System.out.println("[MAIN] - Starting local server TCP on port " + serverTcpPort + " and UDP on port " + serverUdpPort);
+                server.startTCPServer(tcpSocket);
+
+                // create client connected to the newly bound TCP port and server UDP port
+                VoiceChatClient client = new VoiceChatClient("127.0.0.1", serverTcpPort, serverUdpPort);
+                client.joinSession();
+                // add shutdown hook to stop server and client
+                Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                    client.leaveSession();
+                    server.stop();
+                }));
+                return; // local mode runs the client UI and then exits when user leaves
             } catch (Exception e) {
                 e.printStackTrace();
+                server.stop();
+                return;
             }
-        }, "server-udp-thread").start();
-
-        System.out.println("[MAIN] - Server running on UDP port 5555");
-
-        InetAddress localhost = InetAddress.getByName("127.0.0.1");
-
-        // Create two client sockets (each will have its own ephemeral port)
-        DatagramSocket client1 = new DatagramSocket();
-        DatagramSocket client2 = new DatagramSocket();
-
-        System.out.println("[MAIN] - client1 bound to " + client1.getLocalAddress() + ":" + client1.getLocalPort());
-        System.out.println("[MAIN] - client2 bound to " + client2.getLocalAddress() + ":" + client2.getLocalPort());
-
-        // Start listeners for forwarded packets
-        startClientListener(client1, "CLIENT1");
-        startClientListener(client2, "CLIENT2");
-
-        // Send interleaved packets from both clients to server
-        for (int seq = 0; seq < 10; seq++) {
-            byte[] audioData = new byte[320];
-
-            AudioPacket p1 = new AudioPacket(1, seq, audioData);
-            byte[] d1 = server.serializeAudioPacket(p1);
-            client1.send(new DatagramPacket(d1, d1.length, localhost, 5555));
-            System.out.println("[MAIN] - client1 sent seq=" + seq);
-
-            Thread.sleep(15);
-
-            AudioPacket p2 = new AudioPacket(2, seq, audioData);
-            byte[] d2 = server.serializeAudioPacket(p2);
-            client2.send(new DatagramPacket(d2, d2.length, localhost, 5555));
-            System.out.println("[MAIN] - client2 sent seq=" + seq);
-
-            Thread.sleep(20);
+            
+        } else {
+            System.out.println("Usage: java -jar <app.jar> [server|client] (default: server)");
         }
-
-        // Let threads run for a bit to observe forwarded packets
-        Thread.sleep(2000);
-
-    client1.close();
-    client2.close();
-    server.stop();
-        System.out.println("[MAIN] - Done");
     }
 
-    private static void startClientListener(DatagramSocket sock, String name) {
-        new Thread(() -> {
-            try {
-                byte[] buf = new byte[1500];
-                DatagramPacket p = new DatagramPacket(buf, buf.length);
-                while (!sock.isClosed()) {
-                    sock.receive(p);
-                    System.out.println("[" + name + "] - Received forwarded packet length=" + p.getLength() + " from " + p.getAddress() + ":" + p.getPort());
-                }
-            } catch (Exception e) {
-                if (!sock.isClosed()) e.printStackTrace();
-            }
-        }, name + "-listener").start();
-    }
 }

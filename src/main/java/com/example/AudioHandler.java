@@ -1,3 +1,4 @@
+package com.example;
 import java.io.ByteArrayOutputStream;
 import java.io.InterruptedIOException;
 import java.net.*;
@@ -5,15 +6,22 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.TreeMap;
-import javax.sound.sampled.*;
+import java.util.concurrent.TimeUnit;
 import java.io.IOException;
+import javax.sound.sampled.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
+// Suppress resource warnings: `speakers` and `socket` are long-lived resources
+// managed by this class (opened in constructor, closed in stopReceiving()).
+@SuppressWarnings("resource")
 public class AudioHandler {
     private final InetAddress serverAddress;
-    private final int UDP_PORT;
-    private final int CLIENT_ID;
+    private final int serverUdpPort;
+    private volatile int assignedClientId;
     private final AtomicBoolean isMute;
+
+    private static final Logger logger = Logger.getLogger(AudioHandler.class.getName());
 
     private static final float SAMPLE_RATE = 8000.0F;
     private static final int SAMPLE_SIZE_IN_BITS = 16;
@@ -22,7 +30,7 @@ public class AudioHandler {
     private static final boolean BIG_ENDIAN = false; // Audio format is set to Little-Endian
     private static final int BUFFER_SIZE = 320; // 20ms of audio (8000 * 0.02 * 2 bytes/sample)
 
-    private AudioFormat format;
+    private final AudioFormat format;
     private Thread sendThread, receiveThread, playbackThread;
     private volatile boolean isRunning = true;
     
@@ -31,16 +39,14 @@ public class AudioHandler {
     
     // Use ConcurrentSkipListMap for thread-safe, sorted Jitter Buffer by Sequence Number
     private final ConcurrentHashMap<Integer, ConcurrentSkipListMap<Long, byte[]>> jitterBuffers = new ConcurrentHashMap<>();
-    private SourceDataLine speakers;
+    private final SourceDataLine speakers;
 
-    public AudioHandler(InetAddress serverAddress, int UDP_PORT, int CLIENT_ID, AtomicBoolean isMute) throws LineUnavailableException, SocketException {
-        this.UDP_PORT = UDP_PORT;
+    public AudioHandler(InetAddress serverAddress, int serverUdpPort, DatagramSocket socket, int initialClientId, AtomicBoolean isMute) throws LineUnavailableException {
         this.serverAddress = serverAddress;
-        this.CLIENT_ID = CLIENT_ID;
+        this.serverUdpPort = serverUdpPort;
+        this.socket = socket;
+        this.assignedClientId = initialClientId; // may be -1 until registered
         this.isMute = isMute;
-
-        // 1. Create a single DatagramSocket, bound to the specified port (or any available port if UDP_PORT=0)
-        this.socket = new DatagramSocket(this.UDP_PORT); 
 
         format = new AudioFormat(SAMPLE_RATE, SAMPLE_SIZE_IN_BITS, CHANNELS, SIGNED, BIG_ENDIAN);
         DataLine.Info info = new DataLine.Info(SourceDataLine.class, format);
@@ -52,6 +58,10 @@ public class AudioHandler {
     // Method to get the local port for the REGISTER command
     public int getLocalPort() {
         return socket.getLocalPort();
+    }
+
+    public void setAssignedClientId(int id) {
+        this.assignedClientId = id;
     }
 
     public void startStreaming() {
@@ -78,6 +88,7 @@ public class AudioHandler {
         }
     }
 
+    @SuppressWarnings("resource")
     public void stopReceiving() {
         isRunning = false;
         if (receiveThread != null) {
@@ -94,8 +105,16 @@ public class AudioHandler {
                 Thread.currentThread().interrupt();
             }
         }
-        speakers.drain();
-        speakers.close();
+        try {
+            speakers.drain();
+        } catch (IllegalStateException e) {
+            logger.log(Level.FINE, "Speakers drain failed: " + e.getMessage(), e);
+        }
+        try {
+            speakers.close();
+        } catch (IllegalStateException e) {
+            logger.log(Level.FINE, "Speakers close failed: " + e.getMessage(), e);
+        }
         if (socket != null && !socket.isClosed()) {
             socket.close();
         }
@@ -103,13 +122,12 @@ public class AudioHandler {
 
     // AudioSender is modified to adhere to the UDP header structure and mute logic
     private void audioSender() {
-        try { 
-            DataLine.Info mic = new DataLine.Info(TargetDataLine.class, format);
-            TargetDataLine microphone = (TargetDataLine) AudioSystem.getLine(mic);
-            microphone.open(format);
-            microphone.start();
+        DataLine.Info mic = new DataLine.Info(TargetDataLine.class, format);
+        try (TargetDataLine microphone = (TargetDataLine) AudioSystem.getLine(mic)) {
+                microphone.open(format);
+                microphone.start();
 
-            byte[] buffer = new byte[BUFFER_SIZE];
+                byte[] buffer = new byte[BUFFER_SIZE];
             // Sequence number is int (4 bytes) starting at 0
             int sequenceNumber = 0; 
             long lastSendTime = System.currentTimeMillis();
@@ -127,7 +145,7 @@ public class AudioHandler {
                         
                         // Use ByteBuffer to pack the header in Big-Endian
                         ByteBuffer headerBuffer = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN);
-                        headerBuffer.putInt(CLIENT_ID); // 4 bytes clientId
+                        headerBuffer.putInt(assignedClientId); // 4 bytes clientId
                         headerBuffer.putInt(sequenceNumber); // 4 bytes sequenceNumber (int32)
                         headerBuffer.putShort((short) bytesRead); // 2 bytes audioLength (uint16)
                         
@@ -136,7 +154,7 @@ public class AudioHandler {
                         packetData.write(buffer, 0, bytesRead); // Audio payload
 
                         byte[] datasend = packetData.toByteArray();
-                        DatagramPacket packet = new DatagramPacket(datasend, datasend.length, serverAddress, UDP_PORT);
+                        DatagramPacket packet = new DatagramPacket(datasend, datasend.length, serverAddress, serverUdpPort);
                         socket.send(packet);
                         
                         sequenceNumber = (sequenceNumber + 1); // Increment sequence number
@@ -147,32 +165,33 @@ public class AudioHandler {
                     if (System.currentTimeMillis() - lastSendTime > 15000) { // 15 seconds
                          // Send a keepalive packet (header only, audioLength = 0)
                         ByteBuffer headerBuffer = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN);
-                        headerBuffer.putInt(CLIENT_ID);
+                        headerBuffer.putInt(assignedClientId);
                         headerBuffer.putInt(sequenceNumber);
                         headerBuffer.putShort((short) 0); // audioLength = 0
                         
                         byte[] datasend = headerBuffer.array();
-                        DatagramPacket packet = new DatagramPacket(datasend, datasend.length, serverAddress, UDP_PORT);
+                        DatagramPacket packet = new DatagramPacket(datasend, datasend.length, serverAddress, serverUdpPort);
                         socket.send(packet);
                         
                         sequenceNumber = (sequenceNumber + 1);
                         lastSendTime = System.currentTimeMillis();
-                        System.out.println("Sent NAT Keepalive packet.");
+                        logger.fine("Sent NAT Keepalive packet.");
                     }
                     try {
-                        Thread.sleep(FRAME_DURATION_MS); 
+                        TimeUnit.MILLISECONDS.sleep(FRAME_DURATION_MS);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         break;
                     }
                 }
             }
-            microphone.stop();
-            microphone.close();
+        } catch (LineUnavailableException | IllegalArgumentException e) {
+            if (isRunning) {
+                logger.log(Level.SEVERE, "AudioSender initialization error: " + e.getMessage(), e);
+            }
         } catch (Exception e) {
             if (isRunning) {
-                System.err.println("Error in AudioSender: " + e.getMessage());
-                e.printStackTrace();
+                logger.log(Level.SEVERE, "Error in AudioSender: " + e.getMessage(), e);
             }
         }
     }
@@ -185,8 +204,8 @@ public class AudioHandler {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 socket.receive(packet); // Use the created socket
 
-                if (packet.getLength() < 10) { // Packet must have at least 10 bytes of header
-                    System.out.println("Dropping malformed packet: length too small.");
+                    if (packet.getLength() < 10) { // Packet must have at least 10 bytes of header
+                        logger.fine("Dropping malformed packet: length too small.");
                     continue; 
                 }
 
@@ -201,7 +220,7 @@ public class AudioHandler {
                 
                 // Validate packet length
                 if (audioLength > BUFFER_SIZE || audioLength < 0 || packet.getLength() != 10 + audioLength) {
-                    System.out.println("Dropping malformed packet: invalid audioLength or packet size.");
+                    logger.fine("Dropping malformed packet: invalid audioLength or packet size.");
                     continue;
                 }
                 
@@ -218,12 +237,15 @@ public class AudioHandler {
                 if (queue.size() < 200) { // Cap Jitter Buffer size (e.g., 200 frames)
                     queue.put(sequenceNumber, audioData); 
                 }
-            } catch (SocketTimeoutException | InterruptedIOException ignore) {
-                // Ignore timeouts/interrupts
-            } catch (Exception e) {
+            } catch (InterruptedIOException ignore) {
+                // Ignore timeouts/interrupts (covers SocketTimeoutException as it subclasses InterruptedIOException)
+            } catch (IOException e) {
                 if (isRunning) {
-                    System.err.println("Error in AudioReceiver: " + e.getMessage());
-                    e.printStackTrace();
+                    logger.log(Level.SEVERE, "I/O error in AudioReceiver: " + e.getMessage(), e);
+                }
+            } catch (RuntimeException e) {
+                if (isRunning) {
+                    logger.log(Level.SEVERE, "Error in AudioReceiver: " + e.getMessage(), e);
                 }
             }
         }
@@ -248,12 +270,16 @@ public class AudioHandler {
                         byte[] audioData = buffer.remove(oldestKey); 
                         
                         if (audioData != null) {
-                            speakers.write(audioData, 0, audioData.length);
-                            played = true;
+                            try {
+                                speakers.write(audioData, 0, audioData.length);
+                                played = true;
+                            } catch (IllegalStateException | IllegalArgumentException e) {
+                                logger.log(Level.WARNING, "Failed to write to speakers: " + e.getMessage(), e);
+                            }
                         }
                     }
-                } catch (Exception e) {
-                    System.err.println("Error in AudioPlayer: " + e.getMessage());
+                } catch (RuntimeException e) {
+                    logger.log(Level.WARNING, "Error in AudioPlayer: " + e.getMessage(), e);
                 }
             }
             
@@ -261,7 +287,7 @@ public class AudioHandler {
             if (!played) { 
                 try {
                     // Sleep for the frame duration if nothing was played
-                    Thread.sleep(PLAYBACK_INTERVAL_MS); 
+                    TimeUnit.MILLISECONDS.sleep(PLAYBACK_INTERVAL_MS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;

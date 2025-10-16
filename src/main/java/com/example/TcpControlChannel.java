@@ -1,5 +1,9 @@
+package com.example;
 import java.io.*;
 import java.net.*;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+ 
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class TcpControlChannel {
@@ -11,6 +15,8 @@ public class TcpControlChannel {
     private int clientId; // clientId can be changed after REGISTER
     private Thread listenerThread;
     private final AtomicBoolean isConnected = new AtomicBoolean(false);
+    // queue used by registerAndWait to receive assigned id from listener
+    private final BlockingQueue<Integer> registerQueue = new ArrayBlockingQueue<>(1);
 
     public TcpControlChannel(String serverIp, int port, int clientId) {
         this.serverIp = serverIp;
@@ -66,8 +72,11 @@ public class TcpControlChannel {
                     String[] parts = line.split(" ");
                     if (parts.length > 1) {
                         try {
-                            setClientId(Integer.parseInt(parts[1]));
+                            int id = Integer.parseInt(parts[1]);
+                            setClientId(id);
                             System.out.println("Customer ID updated to: " + clientId);
+                            // offer id to any waiting registerAndWait callers (non-blocking)
+                            registerQueue.offer(id);
                         } catch (NumberFormatException ignored) { /* Ignore if no number */ }
                     }
                 } else if (line.startsWith("ERROR")) {
@@ -105,6 +114,23 @@ public class TcpControlChannel {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Send REGISTER and block until the server replies with OK <id> or timeout.
+     * Returns assigned id or -1 on timeout/failure.
+     */
+    public int registerAndWait(int udpPort, long timeoutMs) {
+        if (out == null || !isConnected.get()) return -1;
+        out.println("REGISTER " + udpPort);
+        System.out.println("Sent TCP command: REGISTER " + udpPort + " (waiting for OK)");
+        try {
+            Integer id = registerQueue.poll(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return id == null ? -1 : id;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return -1;
+        }
     }
 
     /**
