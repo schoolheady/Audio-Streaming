@@ -122,6 +122,8 @@ public class TcpControlChannel {
      */
     public int registerAndWait(int udpPort, long timeoutMs) {
         if (out == null || !isConnected.get()) return -1;
+        // clear any stale queued ids before sending a new REGISTER
+        registerQueue.clear();
         out.println("REGISTER " + udpPort);
         System.out.println("Sent TCP command: REGISTER " + udpPort + " (waiting for OK)");
         try {
@@ -151,6 +153,15 @@ public class TcpControlChannel {
     public void disconnect() {
         if (isConnected.getAndSet(false)) {
             try {
+                // Try to notify server we are leaving so it can clean up quickly
+                try {
+                    if (out != null && socket != null && !socket.isClosed()) {
+                        // Send LEAVE to allow server to unregister the client immediately
+                        out.println("LEAVE");
+                        out.flush();
+                    }
+                } catch (Exception ignored) {}
+
                 if (socket != null) {
                     socket.close();
                 }

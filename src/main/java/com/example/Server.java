@@ -306,8 +306,22 @@ public class Server{
                     return;
                 }
 
-                // assign server id 
-                Integer clientId = nextClientId.getAndIncrement();
+                // assign or reuse server id.
+                // If a prior client state exists for the same IP and UDP port, reuse it so rejoining
+                // the same endpoint does not create duplicate client records.
+                InetAddress regAddr = tcpSocket.getInetAddress();
+                Integer clientId = null;
+                for (Map.Entry<Integer, ClientState> e2 : clientStates.entrySet()) {
+                    ClientState existing = e2.getValue();
+                    if (existing != null && existing.clientAddress != null && existing.clientAddress.equals(regAddr) && existing.clientPort == udpPort) {
+                        clientId = e2.getKey();
+                        break;
+                    }
+                }
+
+                if (clientId == null) {
+                    clientId = nextClientId.getAndIncrement();
+                }
 
                 // map tcp socket to client id
                 tcpSocketToClientId.put(tcpSocket, clientId);
@@ -315,9 +329,12 @@ public class Server{
                 // populate or update client state
                 ClientState st = clientStates.computeIfAbsent(clientId, id -> new ClientState());
                 st.clientId = clientId;
-                st.clientAddress = tcpSocket.getInetAddress();
+                st.clientAddress = regAddr;
                 st.clientPort = udpPort;
+                // Reset sequencing and buffers on fresh registration so old expectedSeq doesn't block forwarding
                 st.lastHeard = System.currentTimeMillis();
+                st.expectedSeq = 0;
+                st.buffer.clear();
                 st.status = ClientStatus.ACTIVE;
 
                 // Reply with the assigned client id so client knows it
@@ -387,10 +404,16 @@ public class Server{
                 synchronized (st) {
                     st.status = ClientStatus.LEFT;
                 }
-                // remove mapping to tcp socket (if any) and client state
-                tcpSocketToClientId.values().removeIf(id -> id == clientId);
-                clientStates.remove(clientId);
-                System.out.println("[TCP] - Client " + clientId + " left and unregistered");
+                // remove tcp socket mappings for this client but keep the client state so
+                // the same endpoint can re-register and reuse its id
+                tcpSocketToClientId.entrySet().removeIf(ent -> ent.getValue().equals(clientId));
+                System.out.println("[TCP] - Client " + clientId + " left (state preserved for possible rejoin)");
+            }
+            case "UNMUTE" -> {
+                synchronized (st) {
+                    st.status = ClientStatus.ACTIVE;
+                }
+                System.out.println("[TCP] - Client " + clientId + " unmuted");
             }
             case "JOIN" -> {
                 synchronized (st) {
@@ -421,7 +444,7 @@ public class Server{
         // Get existing client state; do not auto-create because REGISTER should create it
         ClientState state = clientStates.get(audioPacket.clientId);
         if (state == null) {
-            System.out.println("[PROCESS] - Dropping packet for unknown clientId=" + audioPacket.clientId);
+            System.out.println("[PROCESS] - Dropping packet for unknown clientId=" + audioPacket.clientId + " from " + srcAddr + ":" + srcPort + " size=" + (data==null?0:data.length));
             return;
         }
 
@@ -465,7 +488,7 @@ public class Server{
 
             // Process in-order packets starting from expectedSeq
             List<AudioPacket> toSend = new ArrayList<>();
-            while (state.buffer.containsKey(state.expectedSeq)) {
+                while (state.buffer.containsKey(state.expectedSeq)) {
                 AudioPacket next = state.buffer.remove(state.expectedSeq);
                 System.out.println("[PROCESS] - Emitting in-order packet seq=" + next.sequenceNumber + " for client=" + next.clientId);
                 toSend.add(next);
@@ -478,7 +501,9 @@ public class Server{
                 for (ClientState clientState : clientStates.values()) { // iterate over clients
                     if (clientState.clientId == audioPacket.clientId) continue; // skip sender
                     synchronized (clientState) {
-                        if (clientState.status != ClientStatus.ACTIVE) {
+                        // Allow MUTED clients to continue receiving audio from others. Only skip clients
+                        // that have left or are disconnected.
+                        if (clientState.status == ClientStatus.LEFT || clientState.status == ClientStatus.DISCONNECTED) {
                             System.out.println("[PROCESS] - Skipping clientId=" + clientState.clientId + " because status=" + clientState.status);
                             continue;
                         }
