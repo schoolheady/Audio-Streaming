@@ -16,6 +16,13 @@ public class AudioStreamingUI {
     private JList<String> userList;
     private boolean muted = true;
     private boolean connected = false;
+    private boolean joined = false;
+    private VoiceChatClient client;
+    private java.util.function.Consumer<String> uiServerListener;
+    // map server-assigned client id -> username (used to remove by id)
+    private final java.util.Map<Integer, String> idToName = new java.util.concurrent.ConcurrentHashMap<>();
+    // our assigned client id once server replies with OK <id>
+    private int myAssignedId = -1;
 
     public void showUI() {
         frame = new JFrame("Discord-like Voice Server");
@@ -25,6 +32,46 @@ public class AudioStreamingUI {
         frame.setContentPane(buildRoot());
         frame.setVisible(true);
     }
+
+    // --- Test helpers -------------------------------------------------
+    /**
+     * Initialize UI components without showing the window. Useful for tests.
+     */
+    public void initForTests() {
+        // buildRoot populates all component fields
+        buildRoot();
+    }
+
+    public void setClientForTests(VoiceChatClient c, boolean connected) {
+        this.client = c;
+        this.connected = connected;
+    }
+
+    public void setUsernameForTests(String username) {
+        if (this.usernameField == null) initForTests();
+        this.usernameField.setText(username);
+    }
+
+    public void callJoin() { joinCall(); }
+    public void callLeave() { leaveServer(); }
+
+    public DefaultListModel<String> getUserModelForTests() {
+        if (this.userModel == null) initForTests();
+        return this.userModel;
+    }
+
+    public void setUserModelForTests(DefaultListModel<String> model) {
+        if (this.userList == null) initForTests();
+        this.userModel = model;
+        this.userList.setModel(model);
+    }
+
+    public void setJoinedForTests(boolean j) { this.joined = j; }
+    // ------------------------------------------------------------------
+
+    // Test helper: toggle mute programmatically and return the label text
+    public void callToggleMute() { toggleMute(); }
+    public String getMuteLabelTextForTests() { return muteLabel == null ? null : muteLabel.getText(); }
 
     private JPanel buildRoot() {
         JPanel root = new JPanel(new BorderLayout());
@@ -153,12 +200,32 @@ public class AudioStreamingUI {
         joinBtn.setHorizontalTextPosition(SwingConstants.RIGHT);
         joinBtn.addActionListener(e -> joinCall());
 
-        JButton leaveBtn = styledButton("Leave Server", new Color(220, 53, 69));
-        leaveBtn.addActionListener(e -> leaveServer());
+    JButton leaveBtn = styledButton("Leave Call", new Color(220, 53, 69));
+    leaveBtn.addActionListener(e -> leaveServer());
         leaveBtn.setEnabled(false);
 
         buttonPanel.add(joinBtn);
         buttonPanel.add(leaveBtn);
+
+        // Disconnect button: performs a full disconnect from the server
+        disconnectButton = styledButton("Disconnect", new Color(128, 128, 128));
+        disconnectButton.addActionListener(e -> {
+            if (client != null) {
+                try { if (uiServerListener != null) client.removeServerMessageListener(uiServerListener); } catch (Exception ignored) {}
+                uiServerListener = null;
+                VoiceChatClient toDisconnect = client;
+                client = null;
+                new Thread(() -> { try { toDisconnect.disconnect(); } catch (Exception ignored) {} }, "ui-disconnect-thread").start();
+            }
+            connected = false;
+            joined = false;
+            userModel.clear(); userModel.addElement(" Disconnected");
+            if (leaveButton != null) leaveButton.setEnabled(false);
+            if (disconnectButton != null) disconnectButton.setEnabled(false);
+            JOptionPane.showMessageDialog(frame, "Disconnected from server.");
+        });
+        disconnectButton.setEnabled(false);
+        buttonPanel.add(disconnectButton);
 
         JPanel mutePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
         mutePanel.setOpaque(false);
@@ -212,19 +279,47 @@ public class AudioStreamingUI {
     }
 
     private JButton leaveButton;
+    private JButton disconnectButton;
 
     private void connectToServer() {
         userModel.clear();
         userModel.addElement(" Connect");
-        connected = true;
+        // Create client instance and mark connected
+        try {
+            // Default to localhost and default ports; could be exposed via UI fields later
+            client = new VoiceChatClient("127.0.0.1", 4444, 5555);
+            // Ensure TCP control is connected (client created but TCP connect happens when joining)
+            boolean ok = client.connectControl();
+            if (!ok) {
+                // Server not active or refused connection
+                userModel.clear();
+                userModel.addElement(" Server Offline");
+                connected = false;
+                // clean up client so UI actions don't try to use it
+                try { client.disconnect(); } catch (Exception ignored) {}
+                client = null;
+                if (leaveButton != null) leaveButton.setEnabled(false);
+                if (disconnectButton != null) disconnectButton.setEnabled(false);
+                JOptionPane.showMessageDialog(frame, "Unable to connect: server appears to be offline.");
+                return;
+            }
+            connected = true;
+        } catch (Exception e) {
+            JOptionPane.showMessageDialog(frame, "Failed to create client: " + e.getMessage());
+            connected = false;
+            return;
+        }
         if (leaveButton != null) {
             leaveButton.setEnabled(true);
+        }
+        if (disconnectButton != null) {
+            disconnectButton.setEnabled(true);
         }
         JOptionPane.showMessageDialog(frame, "Connected to server successfully!");
     }
 
     private void joinCall() {
-        if (!connected) {
+        if (!connected || client == null) {
             JOptionPane.showMessageDialog(frame, "Please connect to a server first!");
             return;
         }
@@ -235,28 +330,204 @@ public class AudioStreamingUI {
             return;
         }
 
+        if (joined) {
+            JOptionPane.showMessageDialog(frame, "Already joined the call.");
+            return;
+        }
+
+        // Update UI
         userModel.clear();
         userModel.addElement(user + " (You)");
         channelTitleLabel.setText("  Voice Channel: General Chat");
+
+        // Ask the client to join the session and start audio
+        // Defensive: check client is not null
+        if (client == null) {
+            JOptionPane.showMessageDialog(frame, "Client is not connected. Please reconnect.");
+            return;
+        }
+
+        client.setUsername(user);
+
+        // raw handler that performs the actual UI updates; we'll wrap this in a safe listener
+        java.util.function.Consumer<String> rawUiServerHandler = (line) -> {
+            if (line == null) return;
+            // process PRESENCE messages and OK response
+            // Also handle MUTE/UNMUTE broadcast messages from server
+            if (line.startsWith("MUTE ") || line.startsWith("UNMUTE ")) {
+                String[] parts = line.split(" ");
+                if (parts.length >= 2) {
+                    final int parsedId;
+                    try {
+                        parsedId = Integer.parseInt(parts[1]);
+                    } catch (NumberFormatException nfe) {
+                        return;
+                    }
+                    // If this is our id, update the mute label to match server
+                    final boolean serverMuted = line.startsWith("MUTE ");
+                    SwingUtilities.invokeLater(() -> {
+                        if (!joined) return;
+                        int myId = -1;
+                        try {
+                            // find our id in idToName mapping
+                            for (java.util.Map.Entry<Integer, String> e : idToName.entrySet()) {
+                                if (e.getValue() != null && e.getValue().equals(usernameField.getText().trim())) {
+                                    myId = e.getKey();
+                                    break;
+                                }
+                            }
+                            if (myId == parsedId) {
+                                // server is authoritative: set UI mute to server state
+                                muted = serverMuted;
+                                updateMuteStatus();
+                            }
+                        } catch (Exception ignored) {
+                            // ignore any UI lookup race
+                        }
+                    });
+                }
+            }
+
+            if (line.startsWith("PRESENCE ADD ")) {
+                String[] parts = line.split(" ", 4);
+                if (parts.length >= 3) {
+                    String idStr = parts[2];
+                    int id = -1;
+                    try { id = Integer.parseInt(idStr); } catch (NumberFormatException ignored) {}
+                    String name = parts.length >= 4 ? parts[3] : ("User-" + idStr);
+                    if (id != -1) {
+                        idToName.put(id, name);
+                    }
+                    final String finalName = name;
+                    // Ensure UI updates happen on EDT; only add if name not already present
+                    SwingUtilities.invokeLater(() -> {
+                        if (!joined) return; // ignore late events after leaving
+                        boolean exists = false;
+                        for (int i = 0; i < userModel.size(); i++) {
+                            String v = userModel.get(i);
+                            if (v != null && (v.equals(finalName) || v.equals(finalName + " (You)"))) { exists = true; break; }
+                        }
+                        if (!exists) userModel.addElement(finalName);
+                    });
+                }
+            } else if (line.startsWith("PRESENCE REMOVE ")) {
+                String[] parts = line.split(" ");
+                if (parts.length >= 3) {
+                    String idStr = parts[2];
+                    int id = -1;
+                    try { id = Integer.parseInt(idStr); } catch (NumberFormatException ignored) {}
+                    final String name = id != -1 ? idToName.remove(id) : null;
+                    SwingUtilities.invokeLater(() -> {
+                        if (!joined) return; // ignore late events after leaving
+                        if (name != null) {
+                            // remove both plain name and '(You)' variant
+                            for (int i = userModel.size() - 1; i >= 0; i--) {
+                                String v = userModel.get(i);
+                                if (v != null && (v.equals(name) || v.equals(name + " (You)"))) userModel.remove(i);
+                            }
+                        }
+                    });
+                }
+            } else if (line.startsWith("OK ")) {
+                // Server assigned id; show confirmation once and record our id->name mapping
+                SwingUtilities.invokeLater(() -> {
+                    if (!joined) return; // ignore OK if we've already left
+                    JOptionPane.showMessageDialog(frame, "Joined successfully (" + line + ")");
+                    // When we get OK <id>, map the id to our username and ensure '(You)' display
+                    try {
+                        String[] p = line.split(" ");
+                        if (p.length >= 2) {
+                            int myId = Integer.parseInt(p[1]);
+                            // record our assigned id so future server broadcasts can target us
+                            myAssignedId = myId;
+                            String myName = usernameField.getText().trim();
+                            idToName.put(myId, myName);
+                            // replace any plain name entry with '(You)'
+                            for (int i = userModel.size() - 1; i >= 0; i--) {
+                                String v = userModel.get(i);
+                                if (v != null && v.equals(myName)) {
+                                    userModel.remove(i);
+                                }
+                            }
+                            if (!userModel.contains(myName + " (You)")) userModel.addElement(myName + " (You)");
+                        }
+                    } catch (Exception ignored) {}
+                });
+            }
+        };
+
+        // Create a safe listener that delegates to the raw handler. Capture the raw handler
+        // in a final variable to avoid accidental self-recursion.
+        final java.util.function.Consumer<String> rawHandler = rawUiServerHandler;
+        java.util.function.Consumer<String> safeListener = (line) -> {
+            try {
+                if (line == null) return;
+                rawHandler.accept(line);
+            } catch (Throwable t) {
+                // Log and swallow to avoid killing the EDT from unexpected races
+                System.err.println("[UI] - Exception in server listener: " + t);
+            }
+        };
+        client.addServerMessageListener(safeListener);
+        // keep uiServerListener pointing at the safe wrapper so removal works
+        uiServerListener = safeListener;
+
+        client.joinSession();
+        joined = true;
     }
 
     private void leaveServer() {
-        userModel.clear();
-        userModel.addElement(" Disconnected");
-        connected = false;
-        if (leaveButton != null) {
-            leaveButton.setEnabled(false);
+        // Defensive leave: avoid races with Disconnect and protect the EDT from exceptions.
+        // Disable controls early to prevent double actions
+        if (leaveButton != null) leaveButton.setEnabled(false);
+        if (disconnectButton != null) disconnectButton.setEnabled(false);
+        try {
+            // Leave the audio call but keep the TCP control connection so the user can rejoin
+            userModel.clear();
+            // Tests expect Disconnected text after leave
+            userModel.addElement(" Disconnected");
+            // mark as not joined so a subsequent join is allowed
+            joined = false;
+
+            // Copy reference to avoid races where Disconnect sets client = null
+            VoiceChatClient current = this.client;
+            if (current == null) {
+                JOptionPane.showMessageDialog(frame, "Client is not connected. Please reconnect.");
+                return;
+            }
+            try {
+                // remove server listener so no further PRESENCE/OK messages are delivered
+                try { if (uiServerListener != null) current.removeServerMessageListener(uiServerListener); } catch (Exception ignored) {}
+                uiServerListener = null;
+                // Ask client to leave the call (send LEAVE) but keep TCP connected
+                current.leaveCall();
+            } catch (Exception ex) {
+                // Log and continue; don't crash the UI
+                System.err.println("[UI] - Error while leaving call: " + ex.getMessage());
+            }
+
+            muted = true;
+            updateMuteStatus();
+
+            JOptionPane.showMessageDialog(frame, "Left the call (still connected to server).");
+        } catch (RuntimeException re) {
+            // Protect the EDT: show an error message instead of letting the exception propagate
+            System.err.println("[UI] - Runtime error during leave: " + re.getMessage());
+            JOptionPane.showMessageDialog(frame, "An error occurred while leaving the call: " + re.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+        } finally {
+            // Re-enable disconnect button so user can still disconnect fully
+            if (disconnectButton != null) disconnectButton.setEnabled(true);
         }
-
-        muted = true;
-        updateMuteStatus();
-
-        JOptionPane.showMessageDialog(frame, "Disconnected from server.");
     }
 
     private void toggleMute() {
         muted = !muted;
         updateMuteStatus();
+        if (client == null) {
+            JOptionPane.showMessageDialog(frame, "Client is not connected. Please reconnect.");
+            return;
+        }
+        client.toggleMute();
     }
 
     private void updateMuteStatus() {

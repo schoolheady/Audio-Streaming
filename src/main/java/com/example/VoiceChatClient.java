@@ -20,8 +20,32 @@ public class VoiceChatClient {
     private DatagramSocket udpSocket;
     private int localUdpPort = -1;
     private Thread monitorThread;
+    private final java.util.concurrent.atomic.AtomicBoolean isShuttingDown = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private final AtomicBoolean isMute = new AtomicBoolean(false);
+    private String username = "Guest";
+
+    // allow UI to receive raw server messages (PRESENCE etc.)
+    private java.util.function.Consumer<String> serverMessageListener;
+
+    /**
+     * Expose ability for callers to remove the previously added listener.
+     */
+    public void removeServerMessageListener(java.util.function.Consumer<String> listener) {
+        if (listener == null) return;
+        try {
+            if (tcpChannel != null) tcpChannel.removeServerListener(listener);
+        } catch (Exception ignored) {}
+        if (this.serverMessageListener == listener) this.serverMessageListener = null;
+    }
+
+    /**
+     * Return the currently assigned client id (or -1 if none).
+     */
+    public int getAssignedClientId() {
+        if (tcpChannel != null) return tcpChannel.getClientId();
+        return -1;
+    }
 
     public VoiceChatClient() {
         this("127.0.0.1", 4444, 5555);
@@ -59,10 +83,16 @@ public class VoiceChatClient {
                 return;
             }
 
-            logger.info("Connected to TCP. Sending REGISTER command....");
+            logger.info("Connected to TCP. Preparing to send REGISTER command....");
+
+            // If a UI or other listener was registered before joinSession, make sure the TcpControlChannel
+            // has it so it can receive the OK and PRESENCE messages that arrive immediately after REGISTER.
+            if (serverMessageListener != null) {
+                tcpChannel.addServerListener(serverMessageListener);
+            }
 
             // 2. Send REGISTER and wait synchronously for assigned id
-            int assignedId = tcpChannel.registerAndWait(localUdpPort, 3000);
+            int assignedId = tcpChannel.registerAndWait(localUdpPort, username, 3000);
             if (assignedId < 0) {
                 logger.severe("Failed to register with server (no OK reply).");
                 tcpChannel.disconnect();
@@ -89,10 +119,27 @@ public class VoiceChatClient {
             // 5. Send JOIN
             tcpChannel.sendCommand("JOIN");
 
+            // hook up server listener if UI registered one
+            if (serverMessageListener != null) {
+                tcpChannel.addServerListener(serverMessageListener);
+            }
+
             // Start a monitor thread that detects TCP disconnects and attempts reconnect/re-register
             startMonitor();
         } catch (SocketException se) {
             logger.log(Level.SEVERE, "Socket error during joinSession: " + se.getMessage(), se);
+        }
+    }
+
+    /**
+     * Ensure the TCP control channel is connected (without starting audio).
+     * Returns true if connected or successfully connected, false otherwise.
+     */
+    public boolean connectControl() {
+        try {
+            return tcpChannel != null && tcpChannel.connect();
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -151,29 +198,126 @@ public class VoiceChatClient {
     }
 
     public void leaveSession() {
-        if (tcpChannel.isConnected()) {
-            logger.info("Sending LEAVE command...");
-            tcpChannel.sendCommand("LEAVE"); 
-            tcpChannel.disconnect();
+        // Backwards-compatible full shutdown: leave call and disconnect from server.
+        disconnect();
+    }
+
+    /**
+     * Leave the audio call but keep the TCP control channel connected. This allows the
+     * user to "Leave Call" and later "Join Call" quickly without reconnecting to TCP.
+     */
+    public void leaveCall() {
+        // Send LEAVE to server; perform audio shutdown asynchronously so callers (UI) don't block.
+        try {
+            if (tcpChannel != null && tcpChannel.isConnected()) {
+                tcpChannel.sendCommand("LEAVE");
+            }
+        } catch (Exception ignored) {}
+
+        final AudioHandler handler = this.audioHandler;
+        if (handler == null) {
+            logger.info("No audio handler active when leaving call.");
+            return;
         }
-        if (monitorThread != null) {
-            monitorThread.interrupt();
-            monitorThread = null;
-        }
-        if (audioHandler != null) {
-            audioHandler.stopStreaming();
-            audioHandler.stopReceiving();
-        }
-        logger.info("Left the session.");
+
+        // Stop audio on background thread to avoid blocking the caller (UI EDT)
+        Thread stopThread = new Thread(() -> {
+            try {
+                handler.stopStreaming();
+                handler.stopReceiving();
+            } catch (Exception e) {
+                logger.log(Level.WARNING, "Error shutting down audio handler: " + e.getMessage(), e);
+            } finally {
+                // clear reference so a subsequent join creates a fresh handler
+                if (this.audioHandler == handler) this.audioHandler = null;
+            }
+        }, "voicechat-leave-audio-shutdown");
+        stopThread.setDaemon(true);
+        stopThread.start();
+        logger.info("Leaving call: audio shutdown scheduled on background thread.");
+    }
+
+    /**
+     * Fully disconnect from the server: send LEAVE and close TCP, stop audio and monitor.
+     */
+    public void disconnect() {
+        // Make disconnect non-blocking to avoid blocking callers (e.g., UI EDT).
+        if (!isShuttingDown.compareAndSet(false, true)) return;
+
+        Thread shutdown = new Thread(() -> {
+            try {
+                // Remove any server listener first to avoid callbacks during teardown
+                try {
+                    if (serverMessageListener != null && tcpChannel != null) {
+                        tcpChannel.removeServerListener(serverMessageListener);
+                    }
+                } catch (Exception ignored) {}
+
+                if (tcpChannel != null && tcpChannel.isConnected()) {
+                    logger.info("Sending LEAVE command and disconnecting TCP...");
+                    try { tcpChannel.sendCommand("LEAVE"); } catch (Exception ignored) {}
+                    try { tcpChannel.disconnect(); } catch (Exception ignored) {}
+                }
+
+                if (monitorThread != null) {
+                    monitorThread.interrupt();
+                    monitorThread = null;
+                }
+                if (audioHandler != null) {
+                    audioHandler.stopStreaming();
+                    audioHandler.stopReceiving();
+                }
+                try { if (udpSocket != null && !udpSocket.isClosed()) udpSocket.close(); } catch (Exception ignored) {}
+            } finally {
+                isShuttingDown.set(false);
+            }
+            logger.info("Fully disconnected from server.");
+        }, "voicechat-disconnect");
+        shutdown.setDaemon(true);
+        shutdown.start();
+    }
+
+    public void setUsername(String username) { this.username = username == null ? "Guest" : username; }
+
+    public void addServerMessageListener(java.util.function.Consumer<String> listener) {
+        this.serverMessageListener = listener;
+        // If the control channel is already connected, register immediately so listeners
+        // receive in-flight messages.
+        try {
+            if (listener != null && tcpChannel != null && tcpChannel.isConnected()) {
+                tcpChannel.addServerListener(listener);
+            }
+        } catch (Exception ignored) {}
     }
 
     public void toggleMute() {
         boolean mute = !isMute.get();
         isMute.set(mute);
         String command = mute ? "MUTE" : "UNMUTE"; 
-        
+        // Try to send the command immediately. If the TCP control channel is down,
+        // attempt a quick reconnect+register in the background so the server state
+        // is updated (this avoids staying muted when the TCP connection dropped).
         if (tcpChannel.isConnected()) {
             tcpChannel.sendCommand(command);
+        } else {
+            // Non-blocking attempt to reconnect and send the command
+            new Thread(() -> {
+                try {
+                    if (tcpChannel.connect()) {
+                        // try to re-register using our local UDP port (if available)
+                        int port = localUdpPort <= 0 ? -1 : localUdpPort;
+                        if (port > 0) {
+                            int newId = tcpChannel.registerAndWait(port, username, 2000);
+                            if (newId > 0) {
+                                tcpChannel.sendCommand(command);
+                            }
+                        } else {
+                            // If we don't have a UDP port, still try to send command
+                            tcpChannel.sendCommand(command);
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }, "mute-reconnect-thread");
         }
         logger.log(Level.INFO, "Changed mute state to: {0}", mute ? "Muted" : "Unmuted");
     }

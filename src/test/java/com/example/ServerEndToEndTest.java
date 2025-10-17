@@ -16,8 +16,8 @@ public class ServerEndToEndTest {
 
     @Test
     public void endToEndTcpAndUdpFlow() throws Exception {
-        // start the real server bound to UDP port 5555
-        DatagramSocket serverUdp = new DatagramSocket(5555);
+    // start the real server bound to an ephemeral UDP port (avoid collisions on CI/parallel runs)
+    DatagramSocket serverUdp = new DatagramSocket(0);
         Server server = new Server(serverUdp);
 
         // start UDP receiver thread
@@ -39,7 +39,7 @@ public class ServerEndToEndTest {
         DatagramSocket client2Udp = new DatagramSocket();
 
         // register both clients via TCP and keep the control sockets open for the duration of the test
-        Socket t1 = new Socket("127.0.0.1", 4444);
+    Socket t1 = new Socket("127.0.0.1", server.getTcpPort());
         BufferedWriter w1 = new BufferedWriter(new OutputStreamWriter(t1.getOutputStream()));
         BufferedReader r1 = new BufferedReader(new InputStreamReader(t1.getInputStream()));
         w1.write("REGISTER " + client1Udp.getLocalPort() + "\n");
@@ -49,7 +49,7 @@ public class ServerEndToEndTest {
         assertTrue(rep1.startsWith("OK "));
         int id1 = Integer.parseInt(rep1.split("\\s+")[1]);
 
-        Socket t2 = new Socket("127.0.0.1", 4444);
+    Socket t2 = new Socket("127.0.0.1", server.getTcpPort());
         BufferedWriter w2 = new BufferedWriter(new OutputStreamWriter(t2.getOutputStream()));
         BufferedReader r2 = new BufferedReader(new InputStreamReader(t2.getInputStream()));
         w2.write("REGISTER " + client2Udp.getLocalPort() + "\n");
@@ -82,7 +82,7 @@ public class ServerEndToEndTest {
         byte[] audio = new byte[320];
         AudioPacket pkt = new AudioPacket(id1, 0, audio);
         byte[] data = server.serializeAudioPacket(pkt);
-        DatagramPacket send = new DatagramPacket(data, data.length, localhost, 5555);
+    DatagramPacket send = new DatagramPacket(data, data.length, localhost, serverUdp.getLocalPort());
         client1Udp.send(send);
 
         boolean arrived = latch.await(3, TimeUnit.SECONDS);

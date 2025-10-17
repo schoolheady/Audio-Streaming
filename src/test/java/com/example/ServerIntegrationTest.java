@@ -34,7 +34,9 @@ public class ServerIntegrationTest {
         server.startTCPServer();
         Thread.sleep(300); // allow bind
 
-        try (Socket tcp = new Socket("127.0.0.1", 4444)) {
+    server.startTCPServer();
+    Thread.sleep(200);
+    try (Socket tcp = new Socket("127.0.0.1", server.getTcpPort())) {
             BufferedWriter w = new BufferedWriter(new OutputStreamWriter(tcp.getOutputStream()));
             BufferedReader r = new BufferedReader(new InputStreamReader(tcp.getInputStream()));
             w.write("REGISTER 12345\n");

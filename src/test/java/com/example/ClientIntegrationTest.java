@@ -52,21 +52,37 @@ public class ClientIntegrationTest {
         server.startTCPServer();
         Thread.sleep(200);
 
-        // register client1
-        TcpControlChannel c1 = new TcpControlChannel("127.0.0.1", 4444, -1);
+    // register client1
+    TcpControlChannel c1 = new TcpControlChannel("127.0.0.1", server.getTcpPort(), -1);
         assertTrue(c1.connect());
         DatagramSocket u1 = new DatagramSocket(0);
         int p1 = u1.getLocalPort();
         int id1 = c1.registerAndWait(p1, 2000);
     assertTrue(id1 > 0);
+    Thread.sleep(50);
 
-        // register client2
-        TcpControlChannel c2 = new TcpControlChannel("127.0.0.1", 4444, -1);
+    // register client2
+    TcpControlChannel c2 = new TcpControlChannel("127.0.0.1", server.getTcpPort(), -1);
         assertTrue(c2.connect());
         DatagramSocket u2 = new DatagramSocket(0);
         int p2 = u2.getLocalPort();
         int id2 = c2.registerAndWait(p2, 2000);
     assertTrue(id2 > 0);
+    Thread.sleep(50);
+
+        // Sanity-check server's known client states before sending UDP
+        java.lang.reflect.Field f = Server.class.getDeclaredField("clientStates");
+        f.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.ConcurrentHashMap<Integer, ClientState> map = (java.util.concurrent.ConcurrentHashMap<Integer, ClientState>) f.get(server);
+        assertTrue(map.containsKey(id1), "server should have state for client1");
+        assertTrue(map.containsKey(id2), "server should have state for client2");
+        ClientState cs1 = map.get(id1);
+        ClientState cs2 = map.get(id2);
+        assertNotNull(cs1.clientAddress, "client1 address should be set in server state");
+        assertNotNull(cs2.clientAddress, "client2 address should be set in server state");
+        assertEquals(p1, cs1.clientPort, "client1 port should match registered UDP port");
+        assertEquals(p2, cs2.clientPort, "client2 port should match registered UDP port");
     assertNotEquals(id1, id2);
 
         CountDownLatch latch = new CountDownLatch(1);
@@ -85,6 +101,8 @@ public class ClientIntegrationTest {
     listener.setDaemon(true);
     listener.start();
 
+        // ensure listener thread is scheduled and server has had time to register client endpoints
+        Thread.sleep(200);
         // send a packet from client1 to server
         AudioPacket pkt = new AudioPacket(id1, 0, new byte[320]);
         byte[] data = server.serializeAudioPacket(pkt);

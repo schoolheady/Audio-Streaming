@@ -3,6 +3,8 @@ import java.io.*;
 import java.net.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
  
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -17,6 +19,7 @@ public class TcpControlChannel {
     private final AtomicBoolean isConnected = new AtomicBoolean(false);
     // queue used by registerAndWait to receive assigned id from listener
     private final BlockingQueue<Integer> registerQueue = new ArrayBlockingQueue<>(1);
+    private final CopyOnWriteArrayList<Consumer<String>> serverListeners = new CopyOnWriteArrayList<>();
 
     public TcpControlChannel(String serverIp, int port, int clientId) {
         this.serverIp = serverIp;
@@ -37,6 +40,8 @@ public class TcpControlChannel {
      * @return true if connection is successful, false otherwise.
      */
     public boolean connect() {
+        // If already connected, return true (idempotent)
+        if (isConnected.get() && socket != null && !socket.isClosed()) return true;
         try {
             socket = new Socket(serverIp, port);
             out = new PrintWriter(socket.getOutputStream(), true);
@@ -85,6 +90,10 @@ public class TcpControlChannel {
                 } else if (line.equals("HEARTBEAT")) {
                     // Ignore or log HEARTBEAT
                 }
+                // Notify listeners about server lines (PRESENCE ADD/REMOVE etc.)
+                for (Consumer<String> c : serverListeners) {
+                    try { c.accept(line); } catch (Exception ignored) {}
+                }
                 // Can process additional commands from server
             }
         } catch (IOException e) {
@@ -95,6 +104,20 @@ public class TcpControlChannel {
             // When stream is terminated, mark as disconnected
             isConnected.set(false);
             disconnect();
+        }
+    }
+
+    public void addServerListener(Consumer<String> listener) {
+        if (listener == null) return;
+        // avoid duplicate registrations
+        if (!serverListeners.contains(listener)) serverListeners.add(listener);
+    }
+
+    public void removeServerListener(Consumer<String> listener) {
+        if (listener == null) return;
+        // remove any occurrences to ensure complete cleanup
+        while (serverListeners.remove(listener)) {
+            // loop until removed all copies
         }
     }
 
@@ -124,8 +147,17 @@ public class TcpControlChannel {
         if (out == null || !isConnected.get()) return -1;
         // clear any stale queued ids before sending a new REGISTER
         registerQueue.clear();
-        out.println("REGISTER " + udpPort);
-        System.out.println("Sent TCP command: REGISTER " + udpPort + " (waiting for OK)");
+        return registerAndWait(udpPort, null, timeoutMs);
+    }
+
+    public int registerAndWait(int udpPort, String username, long timeoutMs) {
+        if (out == null || !isConnected.get()) return -1;
+        // clear any stale queued ids before sending a new REGISTER
+        registerQueue.clear();
+        String uname = (username == null) ? "" : username.replaceAll("\\s+", "_");
+        String cmd = "REGISTER " + udpPort + (uname.isEmpty() ? "" : " " + uname);
+        out.println(cmd);
+        System.out.println("Sent TCP command: " + cmd + " (waiting for OK)");
         try {
             Integer id = registerQueue.poll(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
             return id == null ? -1 : id;

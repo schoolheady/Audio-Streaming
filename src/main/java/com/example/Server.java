@@ -49,10 +49,34 @@ public class Server{
         this.socket = socket;
     }
 
+    // Broadcast a one-line message to all connected TCP clients (best-effort)
+    private void sendTcpMessageToAll(String message) {
+        for (Socket s : new ArrayList<>(tcpClients)) {
+            try {
+                BufferedWriter w = new BufferedWriter(new OutputStreamWriter(s.getOutputStream(), java.nio.charset.StandardCharsets.UTF_8));
+                w.write(message + "\n");
+                w.flush();
+            } catch (IOException e) {
+                // ignore individual client failures
+            }
+        }
+    }
+
 
     public void startTCPServer() throws Exception{
         // default binding to port 4444
-        startTCPServer(new ServerSocket(4444));
+        // create an unbound ServerSocket so we can set SO_REUSEADDR before binding
+        ServerSocket ss = new ServerSocket();
+        ss.setReuseAddress(true);
+        try {
+            ss.bind(new InetSocketAddress(4444));
+        } catch (java.net.BindException be) {
+            // If port 4444 is already in use (common in fast test runs), fall back to an
+            // ephemeral port assigned by the OS to avoid test failures due to bind races.
+            logger.log(Level.WARNING, "[TCP] - Port 4444 unavailable, falling back to ephemeral port", be);
+            ss.bind(new InetSocketAddress(0));
+        }
+        startTCPServer(ss);
     }
 
     /**
@@ -236,8 +260,17 @@ public class Server{
 
 
     public void tcpConnection() throws Exception{
-    tcpServerSocket = new ServerSocket(4444);
-    logger.info("[TCP] - Listening for TCP clients on port 4444");
+    // create unbound ServerSocket and set reuse before bind to avoid bind races in tests
+    tcpServerSocket = new ServerSocket();
+    tcpServerSocket.setReuseAddress(true);
+    try {
+        tcpServerSocket.bind(new InetSocketAddress(4444));
+        logger.info("[TCP] - Listening for TCP clients on port 4444");
+    } catch (java.net.BindException be) {
+        logger.log(Level.WARNING, "[TCP] - Port 4444 unavailable in tcpConnection(), falling back to ephemeral port", be);
+        tcpServerSocket.bind(new InetSocketAddress(0));
+        logger.info("[TCP] - Listening for TCP clients on ephemeral port " + tcpServerSocket.getLocalPort());
+    }
 
         try {
             while (!tcpServerSocket.isClosed()) {
@@ -267,6 +300,11 @@ public class Server{
         }
     }
 
+    // Expose the actual TCP listening port (useful for tests when server binds to ephemeral port)
+    public int getTcpPort() {
+        return tcpServerSocket == null ? -1 : tcpServerSocket.getLocalPort();
+    }
+
     private class ControlHandler implements Runnable {
         private final Socket tcpSocket;
 
@@ -291,14 +329,16 @@ public class Server{
 
                 String[] parts = reg.trim().split("\\s+");
                 int udpPort;
+                String username = null;
                 try {
-                    if (parts.length != 2) {
+                    if (parts.length < 2) {
                         writer.write("ERROR invalid register\n");
                         writer.flush();
                         try { tcpSocket.close(); } catch (IOException ignored) {}
                         return;
                     }
                     udpPort = Integer.parseInt(parts[1]);
+                    username = parts.length >= 3 ? parts[2] : ("user" + System.currentTimeMillis()%1000);
                 } catch (NumberFormatException ex) {
                     writer.write("ERROR invalid register\n");
                     writer.flush();
@@ -331,6 +371,7 @@ public class Server{
                 st.clientId = clientId;
                 st.clientAddress = regAddr;
                 st.clientPort = udpPort;
+                st.username = username;
                 // Reset sequencing and buffers on fresh registration so old expectedSeq doesn't block forwarding
                 st.lastHeard = System.currentTimeMillis();
                 st.expectedSeq = 0;
@@ -341,6 +382,19 @@ public class Server{
                 writer.write("OK " + clientId + "\n");
                 writer.flush();
                 logger.info("[TCP] - Registered clientId=" + clientId + " udpPort=" + udpPort + " from " + tcpSocket.getRemoteSocketAddress());
+
+                // Notify other TCP clients about this new presence
+                sendTcpMessageToAll("PRESENCE ADD " + clientId + " " + st.username);
+
+                // Send existing presence list to the newly registered client
+                for (Map.Entry<Integer, ClientState> entry : clientStates.entrySet()) {
+                    if (entry.getKey().equals(clientId)) continue;
+                    ClientState cs = entry.getValue();
+                    if (cs != null) {
+                        writer.write("PRESENCE ADD " + cs.clientId + " " + (cs.username == null ? "" : cs.username) + "\n");
+                    }
+                }
+                writer.flush();
 
                 // handle commands from this client until disconnect
                 // make the control socket read interrupt-friendly by using a SO_TIMEOUT
@@ -396,24 +450,28 @@ public class Server{
         switch (command) {
             case "MUTE" -> {
                 synchronized (st) {
-                    st.status = ClientStatus.MUTED;
+                    st.status = ClientStatus.MUTED; 
                 }
                 System.out.println("[TCP] - Client " + clientId + " muted");
+                // Broadcast mute state so UIs can reflect the authoritative server state
+                sendTcpMessageToAll("MUTE " + clientId);
             }
             case "LEAVE" -> {
                 synchronized (st) {
                     st.status = ClientStatus.LEFT;
                 }
-                // remove tcp socket mappings for this client but keep the client state so
-                // the same endpoint can re-register and reuse its id
-                tcpSocketToClientId.entrySet().removeIf(ent -> ent.getValue().equals(clientId));
-                System.out.println("[TCP] - Client " + clientId + " left (state preserved for possible rejoin)");
+                // mark client as LEFT but preserve the tcp socket mapping so the client
+                // can leave and later re-join the call without reconnecting to TCP.
+                System.out.println("[TCP] - Client " + clientId + " left the call (state preserved for rejoin)");
+                sendTcpMessageToAll("PRESENCE REMOVE " + clientId);
             }
             case "UNMUTE" -> {
                 synchronized (st) {
                     st.status = ClientStatus.ACTIVE;
                 }
                 System.out.println("[TCP] - Client " + clientId + " unmuted");
+                // Broadcast unmute state so UIs can reflect the authoritative server state
+                sendTcpMessageToAll("UNMUTE " + clientId);
             }
             case "JOIN" -> {
                 synchronized (st) {
@@ -449,11 +507,21 @@ public class Server{
         }
 
         synchronized (state) {
-            // Verify client status: only accept packets from ACTIVE clients (MUTED clients won't be forwarded)
+            // Verify client status: only forward packets from ACTIVE clients.
             if (state.status != ClientStatus.ACTIVE) {
-                System.out.println("[PROCESS] - Dropping packet from clientId=" + audioPacket.clientId + " due to status=" + state.status);
-                // update lastHeard for presence if it's a packet (optional)
+                // Do not forward audio while muted/left/disconnected, but update sequencing so future
+                // packets from this client don't get permanently blocked due to a missing expectedSeq.
+                System.out.println("[PROCESS] - Received packet from clientId=" + audioPacket.clientId + " but status=" + state.status + " (not forwarding)");
+                // update lastHeard for presence
                 state.lastHeard = System.currentTimeMillis();
+
+                // If the incoming sequence number is at or ahead of expectedSeq, advance expectedSeq
+                // to avoid blocking when the client resumes sending in-order frames.
+                if (audioPacket.sequenceNumber >= state.expectedSeq) {
+                    // set expectedSeq to one past this received packet so later packets can be emitted normally
+                    state.expectedSeq = audioPacket.sequenceNumber + 1;
+                }
+                // Do not buffer or forward this packet.
                 return;
             }
 
@@ -463,7 +531,7 @@ public class Server{
                 state.clientAddress = srcAddr;
                 state.clientPort = srcPort;
             } else {
-                if (!state.clientAddress.equals(srcAddr)) {
+                if (!addressesMatch(state.clientAddress, srcAddr)) {
                     System.out.println("[PROCESS] - Dropping packet: src address " + srcAddr + " doesn't match registered " + state.clientAddress);
                     return;
                 }
@@ -585,6 +653,22 @@ public class Server{
         return data;
     }
 
+    // Compare addresses with a small tolerance for IPv4/IPv6 loopback differences.
+    private boolean addressesMatch(InetAddress a, InetAddress b) {
+        if (a == null || b == null) return false;
+        // Treat IPv4 loopback 127.0.0.1 and IPv6 loopback ::1 as equivalent
+        if (a.isLoopbackAddress() && b.isLoopbackAddress()) {
+            String ha = a.getHostAddress();
+            String hb = b.getHostAddress();
+            // only treat the canonical IPv4 loopback and IPv6 loopback as equivalent
+            if (("::1".equals(ha) && hb.startsWith("127.")) || ("::1".equals(hb) && ha.startsWith("127."))) {
+                return true;
+            }
+            // otherwise fall through to exact match (so 127.0.0.1 != 127.0.0.2)
+        }
+        return a.equals(b);
+    }
+
 }
 
 
@@ -592,6 +676,7 @@ class ClientState {
     int clientId; 
     int clientPort; 
     InetAddress clientAddress; 
+    String username;
     int expectedSeq = 0; 
     ClientStatus status = ClientStatus.ACTIVE; // could be ACTIVE, MUTED, LEFT, DISCONNECTED
     NavigableMap<Integer, AudioPacket> buffer = new TreeMap<>(); 
