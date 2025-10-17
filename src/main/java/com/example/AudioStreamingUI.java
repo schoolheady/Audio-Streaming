@@ -17,6 +17,9 @@ public class AudioStreamingUI {
     private boolean muted = true;
     private boolean connected = false;
 
+    private JButton joinButton;
+    private JButton leaveButton;
+
     public void showUI() {
         frame = new JFrame("Discord-like Voice Server");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
@@ -29,7 +32,6 @@ public class AudioStreamingUI {
     private JPanel buildRoot() {
         JPanel root = new JPanel(new BorderLayout());
         root.setBackground(new Color(43, 45, 49));
-
         root.add(buildHeader(), BorderLayout.NORTH);
 
         JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
@@ -38,11 +40,9 @@ public class AudioStreamingUI {
         splitPane.setDividerLocation(220);
         splitPane.setBorder(null);
         splitPane.setDividerSize(1);
-
         root.add(splitPane, BorderLayout.CENTER);
 
         root.add(buildFooter(), BorderLayout.SOUTH);
-
         return root;
     }
 
@@ -152,10 +152,11 @@ public class AudioStreamingUI {
         joinBtn.setIcon(loadIcon("call.png", 20, 20));
         joinBtn.setHorizontalTextPosition(SwingConstants.RIGHT);
         joinBtn.addActionListener(e -> joinCall());
+        joinBtn.setVisible(false);
 
         JButton leaveBtn = styledButton("Leave Server", new Color(220, 53, 69));
         leaveBtn.addActionListener(e -> leaveServer());
-        leaveBtn.setEnabled(false);
+        leaveBtn.setVisible(false);
 
         buttonPanel.add(joinBtn);
         buttonPanel.add(leaveBtn);
@@ -187,6 +188,7 @@ public class AudioStreamingUI {
         main.add(participantsPanel, BorderLayout.CENTER);
         main.add(controlsPanel, BorderLayout.SOUTH);
 
+        this.joinButton = joinBtn;
         this.leaveButton = leaveBtn;
         updateMuteStatus();
 
@@ -198,11 +200,11 @@ public class AudioStreamingUI {
         footer.setBackground(new Color(37, 39, 43));
         footer.setBorder(new EmptyBorder(6, 20, 6, 20));
 
-        JLabel left = new JLabel(" Connected to server | 3 users online");
+        JLabel left = new JLabel(" Connected to server | Audio Streaming Active");
         left.setForeground(Color.GRAY);
         left.setFont(new Font("Segoe UI", Font.PLAIN, 12));
 
-        JLabel right = new JLabel("© 2025 Discord-like Voice App");
+        JLabel right = new JLabel("© 2025 Voice App");
         right.setForeground(Color.GRAY);
         right.setFont(new Font("Segoe UI", Font.PLAIN, 12));
 
@@ -211,15 +213,11 @@ public class AudioStreamingUI {
         return footer;
     }
 
-    private JButton leaveButton;
-
     private void connectToServer() {
         userModel.clear();
         userModel.addElement(" Connect");
         connected = true;
-        if (leaveButton != null) {
-            leaveButton.setEnabled(true);
-        }
+        if (joinButton != null) joinButton.setVisible(true);
         JOptionPane.showMessageDialog(frame, "Connected to server successfully!");
     }
 
@@ -238,18 +236,20 @@ public class AudioStreamingUI {
         userModel.clear();
         userModel.addElement(user + " (You)");
         channelTitleLabel.setText("  Voice Channel: General Chat");
+
+        joinButton.setVisible(false);
+        leaveButton.setVisible(true);
     }
 
     private void leaveServer() {
         userModel.clear();
         userModel.addElement(" Disconnected");
         connected = false;
-        if (leaveButton != null) {
-            leaveButton.setEnabled(false);
-        }
-
         muted = true;
         updateMuteStatus();
+
+        joinButton.setVisible(true);
+        leaveButton.setVisible(false);
 
         JOptionPane.showMessageDialog(frame, "Disconnected from server.");
     }
@@ -295,14 +295,13 @@ public class AudioStreamingUI {
     }
 
     private static ImageIcon loadIcon(String name, int w, int h) {
-    try {
-        // Vì là static, nên dùng AudioStreamingUI.class thay vì getClass()
-        Image img = new ImageIcon(AudioStreamingUI.class.getResource("/icons/" + name)).getImage();
-        return new ImageIcon(img.getScaledInstance(w, h, Image.SCALE_SMOOTH));
-    } catch (Exception e) {
-        return null;
+        try {
+            Image img = new ImageIcon(AudioStreamingUI.class.getResource("/icons/" + name)).getImage();
+            return new ImageIcon(img.getScaledInstance(w, h, Image.SCALE_SMOOTH));
+        } catch (Exception e) {
+            return null;
+        }
     }
-}
 
     private static class ServerCellRenderer extends DefaultListCellRenderer {
         @Override
@@ -312,18 +311,13 @@ public class AudioStreamingUI {
             label.setBorder(new EmptyBorder(8, 15, 8, 15));
             label.setFont(new Font("Segoe UI", Font.PLAIN, 15));
             label.setForeground(Color.WHITE);
-            if (isSelected) {
-                label.setBackground(new Color(60, 63, 68));
-            } else {
-                label.setBackground(new Color(37, 39, 43));
-            }
+            label.setBackground(isSelected ? new Color(60, 63, 68) : new Color(37, 39, 43));
 
             if ("🎮 My Server".equals(value)) {
-    label.setIcon(loadIcon("server.png", 18, 18));
-    label.setText(" My Server"); 
-    label.setHorizontalTextPosition(SwingConstants.RIGHT); 
-}
-
+                label.setIcon(loadIcon("server.png", 18, 18));
+                label.setText(" My Server");
+                label.setHorizontalTextPosition(SwingConstants.RIGHT);
+            }
             return label;
         }
     }
@@ -336,11 +330,7 @@ public class AudioStreamingUI {
             label.setBorder(new EmptyBorder(6, 15, 6, 15));
             label.setFont(new Font("Segoe UI", Font.PLAIN, 15));
             label.setForeground(Color.WHITE);
-            if (isSelected) {
-                label.setBackground(new Color(60, 63, 68));
-            } else {
-                label.setBackground(new Color(50, 52, 56));
-            }
+            label.setBackground(isSelected ? new Color(60, 63, 68) : new Color(50, 52, 56));
 
             if (" Connect".equals(value)) {
                 label.setForeground(new Color(0, 200, 0));
@@ -349,14 +339,17 @@ public class AudioStreamingUI {
                 label.setForeground(Color.RED);
                 label.setIcon(loadIcon("status_cross.png", 18, 18));
             }
-
             return label;
         }
     }
 
     private static class RoundedPanel extends JPanel {
         private final int radius;
-        public RoundedPanel(int radius) { this.radius = radius; setOpaque(false); }
+        public RoundedPanel(int radius) {
+            this.radius = radius;
+            setOpaque(false);
+        }
+
         @Override
         protected void paintComponent(Graphics g) {
             Graphics2D g2 = (Graphics2D) g.create();
