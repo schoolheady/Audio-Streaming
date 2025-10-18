@@ -1,2 +1,71 @@
 # Audio-Streaming
 Java-based multi-client audio streaming app using UDP for real-time audio and TCP for control. Users can join sessions, talk, self-mute, or mute others.
+
+## Features
+- Real-time audio streaming using UDP
+- Control commands via TCP
+- Multi-client support
+- Self-mute functionality
+- Mute other users capability
+- Session management
+
+## Requirements
+- JDK 8+ installed
+- Microphone and speakers/headset
+- Open firewall for the chosen UDP/TCP ports (when testing across machines)
+
+## Installation
+```bash
+git clone https://github.com/yourusername/Audio-Streaming.git
+cd Audio-Streaming
+```
+
+## Usage
+```bash
+javac *.java
+java AudioStreamingServer
+java AudioStreamingClient
+```
+- If your server/client accept arguments, a common pattern is:
+    - Server: java AudioStreamingServer [udpPort] [tcpPort]
+    - Client: java AudioStreamingClient [host] [udpPort] [tcpPort]
+    Replace with the actual arguments your implementation expects.
+
+## Quick tutorial: local test
+1) Start the server
+     - In Terminal A:
+         ```bash
+         java AudioStreamingServer
+         ```
+     - Note the UDP/TCP ports it prints (or defaults).
+
+2) Start the first client
+     - In Terminal B, connect to the server (localhost for same machine):
+         ```bash
+         java AudioStreamingClient
+         ```
+     - If prompted, enter server host (localhost) and the ports. Otherwise pass them as arguments.
+
+3) Start a second client
+     - In Terminal C:
+         ```bash
+         java AudioStreamingClient
+         ```
+     - Join the same session as the first client.
+
+4) Talk and verify audio
+     - Speak into your microphone on one client and confirm you hear audio on the other.
+     - Use the client’s self-mute control to verify you stop sending audio.
+     - Use the “mute other user” control to verify you stop receiving specific users.
+
+
+## Tips and troubleshooting
+- Allow microphone permissions if prompted by your OS.
+- If you hear nothing:
+    - Verify both clients are in the same session and connected to the correct host/ports.
+    - Check firewall rules on server and client machines.
+    - Reduce other apps using the microphone or speakers.
+- If audio is choppy:
+    - Test on a wired network or reduce background network load.
+
+
