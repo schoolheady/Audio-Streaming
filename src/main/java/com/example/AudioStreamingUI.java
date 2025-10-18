@@ -21,8 +21,9 @@ public class AudioStreamingUI {
     private java.util.function.Consumer<String> uiServerListener;
     // map server-assigned client id -> username (used to remove by id)
     private final java.util.Map<Integer, String> idToName = new java.util.concurrent.ConcurrentHashMap<>();
-    // our assigned client id once server replies with OK <id>
-    private int myAssignedId = -1;
+
+    private JButton joinButton;
+    private JButton leaveButton;
 
     public void showUI() {
         frame = new JFrame("Discord-like Voice Server");
@@ -76,7 +77,6 @@ public class AudioStreamingUI {
     private JPanel buildRoot() {
         JPanel root = new JPanel(new BorderLayout());
         root.setBackground(new Color(43, 45, 49));
-
         root.add(buildHeader(), BorderLayout.NORTH);
 
         JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
@@ -85,11 +85,9 @@ public class AudioStreamingUI {
         splitPane.setDividerLocation(220);
         splitPane.setBorder(null);
         splitPane.setDividerSize(1);
-
         root.add(splitPane, BorderLayout.CENTER);
 
         root.add(buildFooter(), BorderLayout.SOUTH);
-
         return root;
     }
 
@@ -199,10 +197,11 @@ public class AudioStreamingUI {
         joinBtn.setIcon(loadIcon("call.png", 20, 20));
         joinBtn.setHorizontalTextPosition(SwingConstants.RIGHT);
         joinBtn.addActionListener(e -> joinCall());
+        joinBtn.setVisible(false);
 
     JButton leaveBtn = styledButton("Leave Call", new Color(220, 53, 69));
     leaveBtn.addActionListener(e -> leaveServer());
-        leaveBtn.setEnabled(false);
+        leaveBtn.setVisible(false);
 
         buttonPanel.add(joinBtn);
         buttonPanel.add(leaveBtn);
@@ -254,6 +253,7 @@ public class AudioStreamingUI {
         main.add(participantsPanel, BorderLayout.CENTER);
         main.add(controlsPanel, BorderLayout.SOUTH);
 
+        this.joinButton = joinBtn;
         this.leaveButton = leaveBtn;
         updateMuteStatus();
 
@@ -265,11 +265,11 @@ public class AudioStreamingUI {
         footer.setBackground(new Color(37, 39, 43));
         footer.setBorder(new EmptyBorder(6, 20, 6, 20));
 
-        JLabel left = new JLabel(" Connected to server | 3 users online");
+        JLabel left = new JLabel(" Connected to server | Audio Streaming Active");
         left.setForeground(Color.GRAY);
         left.setFont(new Font("Segoe UI", Font.PLAIN, 12));
 
-        JLabel right = new JLabel("© 2025 Discord-like Voice App");
+        JLabel right = new JLabel("© 2025 Voice App");
         right.setForeground(Color.GRAY);
         right.setFont(new Font("Segoe UI", Font.PLAIN, 12));
 
@@ -277,8 +277,6 @@ public class AudioStreamingUI {
         footer.add(right, BorderLayout.EAST);
         return footer;
     }
-
-    private JButton leaveButton;
     private JButton disconnectButton;
 
     private void connectToServer() {
@@ -309,9 +307,7 @@ public class AudioStreamingUI {
             connected = false;
             return;
         }
-        if (leaveButton != null) {
-            leaveButton.setEnabled(true);
-        }
+        if (joinButton != null) joinButton.setVisible(true);
         if (disconnectButton != null) {
             disconnectButton.setEnabled(true);
         }
@@ -353,41 +349,6 @@ public class AudioStreamingUI {
         java.util.function.Consumer<String> rawUiServerHandler = (line) -> {
             if (line == null) return;
             // process PRESENCE messages and OK response
-            // Also handle MUTE/UNMUTE broadcast messages from server
-            if (line.startsWith("MUTE ") || line.startsWith("UNMUTE ")) {
-                String[] parts = line.split(" ");
-                if (parts.length >= 2) {
-                    final int parsedId;
-                    try {
-                        parsedId = Integer.parseInt(parts[1]);
-                    } catch (NumberFormatException nfe) {
-                        return;
-                    }
-                    // If this is our id, update the mute label to match server
-                    final boolean serverMuted = line.startsWith("MUTE ");
-                    SwingUtilities.invokeLater(() -> {
-                        if (!joined) return;
-                        int myId = -1;
-                        try {
-                            // find our id in idToName mapping
-                            for (java.util.Map.Entry<Integer, String> e : idToName.entrySet()) {
-                                if (e.getValue() != null && e.getValue().equals(usernameField.getText().trim())) {
-                                    myId = e.getKey();
-                                    break;
-                                }
-                            }
-                            if (myId == parsedId) {
-                                // server is authoritative: set UI mute to server state
-                                muted = serverMuted;
-                                updateMuteStatus();
-                            }
-                        } catch (Exception ignored) {
-                            // ignore any UI lookup race
-                        }
-                    });
-                }
-            }
-
             if (line.startsWith("PRESENCE ADD ")) {
                 String[] parts = line.split(" ", 4);
                 if (parts.length >= 3) {
@@ -438,8 +399,6 @@ public class AudioStreamingUI {
                         String[] p = line.split(" ");
                         if (p.length >= 2) {
                             int myId = Integer.parseInt(p[1]);
-                            // record our assigned id so future server broadcasts can target us
-                            myAssignedId = myId;
                             String myName = usernameField.getText().trim();
                             idToName.put(myId, myName);
                             // replace any plain name entry with '(You)'
@@ -474,18 +433,21 @@ public class AudioStreamingUI {
 
         client.joinSession();
         joined = true;
+        
+        // Show Leave button, hide Join button
+        if (joinButton != null) joinButton.setVisible(false);
+        if (leaveButton != null) leaveButton.setVisible(true);
     }
 
     private void leaveServer() {
         // Defensive leave: avoid races with Disconnect and protect the EDT from exceptions.
         // Disable controls early to prevent double actions
-        if (leaveButton != null) leaveButton.setEnabled(false);
+        if (leaveButton != null) leaveButton.setVisible(false);
         if (disconnectButton != null) disconnectButton.setEnabled(false);
         try {
             // Leave the audio call but keep the TCP control connection so the user can rejoin
             userModel.clear();
-            // Tests expect Disconnected text after leave
-            userModel.addElement(" Disconnected");
+            userModel.addElement(" Not in call");
             // mark as not joined so a subsequent join is allowed
             joined = false;
 
@@ -515,8 +477,9 @@ public class AudioStreamingUI {
             System.err.println("[UI] - Runtime error during leave: " + re.getMessage());
             JOptionPane.showMessageDialog(frame, "An error occurred while leaving the call: " + re.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
         } finally {
-            // Re-enable disconnect button so user can still disconnect fully
+            // Re-enable disconnect button and show join button so user can rejoin or disconnect
             if (disconnectButton != null) disconnectButton.setEnabled(true);
+            if (joinButton != null) joinButton.setVisible(true);
         }
     }
 
@@ -566,14 +529,13 @@ public class AudioStreamingUI {
     }
 
     private static ImageIcon loadIcon(String name, int w, int h) {
-    try {
-        // Vì là static, nên dùng AudioStreamingUI.class thay vì getClass()
-        Image img = new ImageIcon(AudioStreamingUI.class.getResource("/icons/" + name)).getImage();
-        return new ImageIcon(img.getScaledInstance(w, h, Image.SCALE_SMOOTH));
-    } catch (Exception e) {
-        return null;
+        try {
+            Image img = new ImageIcon(AudioStreamingUI.class.getResource("/icons/" + name)).getImage();
+            return new ImageIcon(img.getScaledInstance(w, h, Image.SCALE_SMOOTH));
+        } catch (Exception e) {
+            return null;
+        }
     }
-}
 
     private static class ServerCellRenderer extends DefaultListCellRenderer {
         @Override
@@ -583,18 +545,13 @@ public class AudioStreamingUI {
             label.setBorder(new EmptyBorder(8, 15, 8, 15));
             label.setFont(new Font("Segoe UI", Font.PLAIN, 15));
             label.setForeground(Color.WHITE);
-            if (isSelected) {
-                label.setBackground(new Color(60, 63, 68));
-            } else {
-                label.setBackground(new Color(37, 39, 43));
-            }
+            label.setBackground(isSelected ? new Color(60, 63, 68) : new Color(37, 39, 43));
 
             if ("🎮 My Server".equals(value)) {
-    label.setIcon(loadIcon("server.png", 18, 18));
-    label.setText(" My Server"); 
-    label.setHorizontalTextPosition(SwingConstants.RIGHT); 
-}
-
+                label.setIcon(loadIcon("server.png", 18, 18));
+                label.setText(" My Server");
+                label.setHorizontalTextPosition(SwingConstants.RIGHT);
+            }
             return label;
         }
     }
@@ -607,11 +564,7 @@ public class AudioStreamingUI {
             label.setBorder(new EmptyBorder(6, 15, 6, 15));
             label.setFont(new Font("Segoe UI", Font.PLAIN, 15));
             label.setForeground(Color.WHITE);
-            if (isSelected) {
-                label.setBackground(new Color(60, 63, 68));
-            } else {
-                label.setBackground(new Color(50, 52, 56));
-            }
+            label.setBackground(isSelected ? new Color(60, 63, 68) : new Color(50, 52, 56));
 
             if (" Connect".equals(value)) {
                 label.setForeground(new Color(0, 200, 0));
@@ -620,14 +573,17 @@ public class AudioStreamingUI {
                 label.setForeground(Color.RED);
                 label.setIcon(loadIcon("status_cross.png", 18, 18));
             }
-
             return label;
         }
     }
 
     private static class RoundedPanel extends JPanel {
         private final int radius;
-        public RoundedPanel(int radius) { this.radius = radius; setOpaque(false); }
+        public RoundedPanel(int radius) {
+            this.radius = radius;
+            setOpaque(false);
+        }
+
         @Override
         protected void paintComponent(Graphics g) {
             Graphics2D g2 = (Graphics2D) g.create();
