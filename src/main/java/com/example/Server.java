@@ -366,12 +366,34 @@ public class Server{
                 // map tcp socket to client id
                 tcpSocketToClientId.put(tcpSocket, clientId);
 
-                // populate or update client state
+                // Get or create client state first (we need to know the old username before duplicate checking)
                 ClientState st = clientStates.computeIfAbsent(clientId, id -> new ClientState());
+                String oldUsername = st.username; // preserve old username in case of re-registration
+
+                // Handle duplicate usernames: check if username already exists and append ID if needed
+                // Skip both the current clientId AND its old username when checking for duplicates
+                String finalUsername = username;
+                int nameCount = 0;
+                boolean nameExists = true;
+                while (nameExists) {
+                    nameExists = false;
+                    for (Map.Entry<Integer, ClientState> entry : clientStates.entrySet()) {
+                        if (entry.getKey().equals(clientId)) continue; // skip self
+                        ClientState cs = entry.getValue();
+                        if (cs != null && cs.username != null && cs.username.equals(finalUsername)) {
+                            nameExists = true;
+                            nameCount++;
+                            finalUsername = username + "#" + nameCount;
+                            break;
+                        }
+                    }
+                }
+
+                // populate or update client state
                 st.clientId = clientId;
                 st.clientAddress = regAddr;
                 st.clientPort = udpPort;
-                st.username = username;
+                st.username = finalUsername;
                 // Reset sequencing and buffers on fresh registration so old expectedSeq doesn't block forwarding
                 st.lastHeard = System.currentTimeMillis();
                 st.expectedSeq = 0;
@@ -387,10 +409,11 @@ public class Server{
                 sendTcpMessageToAll("PRESENCE ADD " + clientId + " " + st.username);
 
                 // Send existing presence list to the newly registered client
+                // Only include clients that are currently ACTIVE or MUTED (in the call)
                 for (Map.Entry<Integer, ClientState> entry : clientStates.entrySet()) {
                     if (entry.getKey().equals(clientId)) continue;
                     ClientState cs = entry.getValue();
-                    if (cs != null) {
+                    if (cs != null && (cs.status == ClientStatus.ACTIVE || cs.status == ClientStatus.MUTED)) {
                         writer.write("PRESENCE ADD " + cs.clientId + " " + (cs.username == null ? "" : cs.username) + "\n");
                     }
                 }
@@ -430,7 +453,13 @@ public class Server{
                 if (removed != null) {
                     ClientState st = clientStates.get(removed);
                     if (st != null) {
+                        // Only send PRESENCE REMOVE if the client was previously in the call (ACTIVE or MUTED)
+                        // Don't send duplicate PRESENCE REMOVE if already LEFT
+                        boolean wasInCall = (st.status == ClientStatus.ACTIVE || st.status == ClientStatus.MUTED);
                         st.status = ClientStatus.DISCONNECTED;
+                        if (wasInCall) {
+                            sendTcpMessageToAll("PRESENCE REMOVE " + removed);
+                        }
                     }
                 }
                 try { tcpSocket.close(); } catch (IOException ignored) {}
@@ -474,10 +503,17 @@ public class Server{
                 sendTcpMessageToAll("UNMUTE " + clientId);
             }
             case "JOIN" -> {
+                    boolean wasLeft = false;
                 synchronized (st) {
+                        wasLeft = (st.status == ClientStatus.LEFT);
                     st.status = ClientStatus.ACTIVE;
                 }
                 System.out.println("[TCP] - Client " + clientId + " joined (ACTIVE)");
+                    // Only broadcast PRESENCE ADD if client is rejoining after leaving
+                    // (initial join already broadcasts PRESENCE ADD during REGISTER)
+                    if (wasLeft) {
+                        sendTcpMessageToAll("PRESENCE ADD " + clientId + " " + st.username);
+                    }
             }
             default -> System.out.println("[SERVER] - Unknown command: " + command);
         }

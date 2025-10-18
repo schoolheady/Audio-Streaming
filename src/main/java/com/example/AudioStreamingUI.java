@@ -21,6 +21,8 @@ public class AudioStreamingUI {
     private java.util.function.Consumer<String> uiServerListener;
     // map server-assigned client id -> username (used to remove by id)
     private final java.util.Map<Integer, String> idToName = new java.util.concurrent.ConcurrentHashMap<>();
+    // our assigned client id once server replies with OK <id>
+    private int myAssignedId = -1;
 
     private JButton joinButton;
     private JButton leaveButton;
@@ -177,21 +179,40 @@ public class AudioStreamingUI {
         controlsPanel.setBackground(new Color(50, 52, 56));
         controlsPanel.setLayout(new BoxLayout(controlsPanel, BoxLayout.Y_AXIS));
         controlsPanel.setBorder(new EmptyBorder(15, 20, 15, 20));
+        // ensure controlsPanel's children align to left by default
+        controlsPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        // Create a container for username section with proper left alignment
+        JPanel usernamePanel = new JPanel();
+        usernamePanel.setLayout(new BoxLayout(usernamePanel, BoxLayout.Y_AXIS));
+        usernamePanel.setOpaque(false);
+        usernamePanel.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         JLabel userLabel = new JLabel("Enter your username:");
         userLabel.setForeground(Color.LIGHT_GRAY);
         userLabel.setFont(new Font("Segoe UI", Font.PLAIN, 14));
+        // critical: force left alignment on the label
+        userLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         usernameField = new JTextField("Guest");
         usernameField.setFont(new Font("Segoe UI", Font.PLAIN, 16));
-        usernameField.setMaximumSize(new Dimension(Integer.MAX_VALUE, 38));
+        usernameField.setPreferredSize(new Dimension(300, 38));
+        usernameField.setMaximumSize(new Dimension(300, 38));
         usernameField.setBackground(new Color(60, 63, 68));
         usernameField.setForeground(Color.WHITE);
         usernameField.setBorder(BorderFactory.createLineBorder(new Color(80, 80, 80)));
         usernameField.setCaretColor(Color.WHITE);
+        // critical: force left alignment on the text field
+        usernameField.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        usernamePanel.add(userLabel);
+        usernamePanel.add(Box.createVerticalStrut(6));
+        usernamePanel.add(usernameField);
 
         JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
         buttonPanel.setOpaque(false);
+        // force left alignment so FlowLayout-left panel sits to the left in BoxLayout
+        buttonPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         JButton joinBtn = styledButton("Join Call", new Color(59, 130, 246));
         joinBtn.setIcon(loadIcon("call.png", 20, 20));
@@ -199,35 +220,17 @@ public class AudioStreamingUI {
         joinBtn.addActionListener(e -> joinCall());
         joinBtn.setVisible(false);
 
-    JButton leaveBtn = styledButton("Leave Call", new Color(220, 53, 69));
-    leaveBtn.addActionListener(e -> leaveServer());
+        JButton leaveBtn = styledButton("Leave Call", new Color(220, 53, 69));
+        leaveBtn.addActionListener(e -> leaveServer());
         leaveBtn.setVisible(false);
 
         buttonPanel.add(joinBtn);
         buttonPanel.add(leaveBtn);
 
-        // Disconnect button: performs a full disconnect from the server
-        disconnectButton = styledButton("Disconnect", new Color(128, 128, 128));
-        disconnectButton.addActionListener(e -> {
-            if (client != null) {
-                try { if (uiServerListener != null) client.removeServerMessageListener(uiServerListener); } catch (Exception ignored) {}
-                uiServerListener = null;
-                VoiceChatClient toDisconnect = client;
-                client = null;
-                new Thread(() -> { try { toDisconnect.disconnect(); } catch (Exception ignored) {} }, "ui-disconnect-thread").start();
-            }
-            connected = false;
-            joined = false;
-            userModel.clear(); userModel.addElement(" Disconnected");
-            if (leaveButton != null) leaveButton.setEnabled(false);
-            if (disconnectButton != null) disconnectButton.setEnabled(false);
-            JOptionPane.showMessageDialog(frame, "Disconnected from server.");
-        });
-        disconnectButton.setEnabled(false);
-        buttonPanel.add(disconnectButton);
-
         JPanel mutePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
         mutePanel.setOpaque(false);
+        // also force left alignment for mute panel
+        mutePanel.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         JButton muteBtn = styledButton("Toggle Mute", new Color(75, 130, 246));
         muteBtn.addActionListener(e -> toggleMute());
@@ -239,9 +242,7 @@ public class AudioStreamingUI {
         mutePanel.add(muteBtn);
         mutePanel.add(muteLabel);
 
-        controlsPanel.add(userLabel);
-        controlsPanel.add(Box.createVerticalStrut(6));
-        controlsPanel.add(usernameField);
+        controlsPanel.add(usernamePanel);
         controlsPanel.add(Box.createVerticalStrut(12));
         controlsPanel.add(buttonPanel);
         controlsPanel.add(Box.createVerticalStrut(15));
@@ -277,7 +278,6 @@ public class AudioStreamingUI {
         footer.add(right, BorderLayout.EAST);
         return footer;
     }
-    private JButton disconnectButton;
 
     private void connectToServer() {
         userModel.clear();
@@ -296,8 +296,8 @@ public class AudioStreamingUI {
                 // clean up client so UI actions don't try to use it
                 try { client.disconnect(); } catch (Exception ignored) {}
                 client = null;
-                if (leaveButton != null) leaveButton.setEnabled(false);
-                if (disconnectButton != null) disconnectButton.setEnabled(false);
+                if (joinButton != null) joinButton.setVisible(false);
+                if (leaveButton != null) leaveButton.setVisible(false);
                 JOptionPane.showMessageDialog(frame, "Unable to connect: server appears to be offline.");
                 return;
             }
@@ -308,9 +308,6 @@ public class AudioStreamingUI {
             return;
         }
         if (joinButton != null) joinButton.setVisible(true);
-        if (disconnectButton != null) {
-            disconnectButton.setEnabled(true);
-        }
         JOptionPane.showMessageDialog(frame, "Connected to server successfully!");
     }
 
@@ -356,19 +353,45 @@ public class AudioStreamingUI {
                     int id = -1;
                     try { id = Integer.parseInt(idStr); } catch (NumberFormatException ignored) {}
                     String name = parts.length >= 4 ? parts[3] : ("User-" + idStr);
+                    final String previousName;
                     if (id != -1) {
-                        idToName.put(id, name);
+                        previousName = idToName.put(id, name);
+                    } else {
+                        previousName = null;
                     }
                     final String finalName = name;
+                    final int finalId = id;
                     // Ensure UI updates happen on EDT; only add if name not already present
                     SwingUtilities.invokeLater(() -> {
                         if (!joined) return; // ignore late events after leaving
+                        
+                        // Skip adding our own entry from PRESENCE broadcasts - we already show "(You)"
+                        if (finalId == myAssignedId && myAssignedId > 0) {
+                            // This is our own presence - update the idToName mapping but don't add to list
+                            // (the OK handler already added us with "(You)")
+                            System.out.println("[UI] - Skipping PRESENCE ADD for own ID: " + finalId + " (name: " + finalName + ")");
+                            return;
+                        }
+                        
+                        // If this id was previously known under a different name, remove the old entry
+                        if (previousName != null && !previousName.equals(finalName)) {
+                            System.out.println("[UI] - ID " + finalId + " changed name from '" + previousName + "' to '" + finalName + "'");
+                            for (int i = userModel.size() - 1; i >= 0; i--) {
+                                String v = userModel.get(i);
+                                if (v != null && (v.equals(previousName) || v.equals(previousName + " (You)"))) {
+                                    userModel.remove(i);
+                                }
+                            }
+                        }
                         boolean exists = false;
                         for (int i = 0; i < userModel.size(); i++) {
                             String v = userModel.get(i);
                             if (v != null && (v.equals(finalName) || v.equals(finalName + " (You)"))) { exists = true; break; }
                         }
-                        if (!exists) userModel.addElement(finalName);
+                        if (!exists) {
+                            userModel.addElement(finalName);
+                            System.out.println("[UI] - Added '" + finalName + "' to participants list (ID: " + finalId + ")");
+                        }
                     });
                 }
             } else if (line.startsWith("PRESENCE REMOVE ")) {
@@ -378,27 +401,41 @@ public class AudioStreamingUI {
                     int id = -1;
                     try { id = Integer.parseInt(idStr); } catch (NumberFormatException ignored) {}
                     final String name = id != -1 ? idToName.remove(id) : null;
+                    final int finalId = id;
                     SwingUtilities.invokeLater(() -> {
                         if (!joined) return; // ignore late events after leaving
+                        
+                        // If we don't have a name for this ID, it might be a stale entry or our own ID
+                        // In that case, try to remove by checking if any entry matches this ID
+                        if (name == null && finalId > 0) {
+                            // This might be our own disconnect or a client we didn't track properly
+                            // Just log and skip - we shouldn't have entries for unknown IDs anyway
+                            System.out.println("[UI] - Received PRESENCE REMOVE for unknown ID: " + finalId);
+                            return;
+                        }
+                        
                         if (name != null) {
                             // remove both plain name and '(You)' variant
                             for (int i = userModel.size() - 1; i >= 0; i--) {
                                 String v = userModel.get(i);
-                                if (v != null && (v.equals(name) || v.equals(name + " (You)"))) userModel.remove(i);
+                                if (v != null && (v.equals(name) || v.equals(name + " (You)"))) {
+                                    userModel.remove(i);
+                                    System.out.println("[UI] - Removed '" + v + "' from participants list (ID: " + finalId + ")");
+                                }
                             }
                         }
                     });
                 }
             } else if (line.startsWith("OK ")) {
-                // Server assigned id; show confirmation once and record our id->name mapping
+                // Server assigned id; record our id->name mapping
                 SwingUtilities.invokeLater(() -> {
                     if (!joined) return; // ignore OK if we've already left
-                    JOptionPane.showMessageDialog(frame, "Joined successfully (" + line + ")");
                     // When we get OK <id>, map the id to our username and ensure '(You)' display
                     try {
                         String[] p = line.split(" ");
                         if (p.length >= 2) {
                             int myId = Integer.parseInt(p[1]);
+                            myAssignedId = myId; // Store our assigned ID
                             String myName = usernameField.getText().trim();
                             idToName.put(myId, myName);
                             // replace any plain name entry with '(You)'
@@ -436,50 +473,60 @@ public class AudioStreamingUI {
         
         // Show Leave button, hide Join button
         if (joinButton != null) joinButton.setVisible(false);
-        if (leaveButton != null) leaveButton.setVisible(true);
+        if (leaveButton != null) {
+            leaveButton.setEnabled(true);  // Ensure it's enabled
+            leaveButton.setVisible(true);
+        }
     }
 
     private void leaveServer() {
-        // Defensive leave: avoid races with Disconnect and protect the EDT from exceptions.
+        // Full disconnect: leave call and disconnect from server
         // Disable controls early to prevent double actions
         if (leaveButton != null) leaveButton.setVisible(false);
-        if (disconnectButton != null) disconnectButton.setEnabled(false);
+        if (joinButton != null) joinButton.setVisible(false);
+        
         try {
-            // Leave the audio call but keep the TCP control connection so the user can rejoin
-            userModel.clear();
-            userModel.addElement(" Not in call");
-            // mark as not joined so a subsequent join is allowed
+            // CRITICAL: Set joined = false FIRST to prevent any late PRESENCE messages from being processed
             joined = false;
-
-            // Copy reference to avoid races where Disconnect sets client = null
+            
+            // Copy reference to avoid races
             VoiceChatClient current = this.client;
             if (current == null) {
-                JOptionPane.showMessageDialog(frame, "Client is not connected. Please reconnect.");
+                JOptionPane.showMessageDialog(frame, "Client is not connected.");
                 return;
             }
-            try {
-                // remove server listener so no further PRESENCE/OK messages are delivered
-                try { if (uiServerListener != null) current.removeServerMessageListener(uiServerListener); } catch (Exception ignored) {}
-                uiServerListener = null;
-                // Ask client to leave the call (send LEAVE) but keep TCP connected
-                current.leaveCall();
-            } catch (Exception ex) {
-                // Log and continue; don't crash the UI
-                System.err.println("[UI] - Error while leaving call: " + ex.getMessage());
-            }
+            
+            // Remove server listener immediately after setting joined=false
+            try { 
+                if (uiServerListener != null) current.removeServerMessageListener(uiServerListener); 
+            } catch (Exception ignored) {}
+            uiServerListener = null;
+            
+            // Now safely clear UI state
+            userModel.clear();
+            userModel.addElement(" Disconnected");
+            connected = false;
+            
+            // Clear idToName mapping and reset our assigned ID to avoid stale entries on reconnect/rejoin
+            idToName.clear();
+            myAssignedId = -1;
+            
+            // Perform full disconnect on background thread
+            client = null;
+            new Thread(() -> { 
+                try { 
+                    current.disconnect(); 
+                } catch (Exception ignored) {} 
+            }, "ui-disconnect-thread").start();
 
             muted = true;
             updateMuteStatus();
 
-            JOptionPane.showMessageDialog(frame, "Left the call (still connected to server).");
+            JOptionPane.showMessageDialog(frame, "Disconnected from server.");
         } catch (RuntimeException re) {
             // Protect the EDT: show an error message instead of letting the exception propagate
-            System.err.println("[UI] - Runtime error during leave: " + re.getMessage());
-            JOptionPane.showMessageDialog(frame, "An error occurred while leaving the call: " + re.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
-        } finally {
-            // Re-enable disconnect button and show join button so user can rejoin or disconnect
-            if (disconnectButton != null) disconnectButton.setEnabled(true);
-            if (joinButton != null) joinButton.setVisible(true);
+            System.err.println("[UI] - Runtime error during disconnect: " + re.getMessage());
+            JOptionPane.showMessageDialog(frame, "An error occurred while disconnecting: " + re.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
         }
     }
 
@@ -496,11 +543,11 @@ public class AudioStreamingUI {
     private void updateMuteStatus() {
         if (muted) {
             muteLabel.setIcon(loadIcon("mute.png", 22, 22));
-            muteLabel.setText("Microphone: OFF");
+            muteLabel.setText("Mute: OFF");
             muteLabel.setForeground(Color.RED);
         } else {
             muteLabel.setIcon(loadIcon("mic.png", 22, 22));
-            muteLabel.setText("Microphone: ON");
+            muteLabel.setText("Mute: ON");
             muteLabel.setForeground(new Color(0, 200, 0));
         }
     }
