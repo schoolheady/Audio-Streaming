@@ -1,4 +1,4 @@
-package com.example;
+package com.audiostreaming;
 import java.io.ByteArrayOutputStream;
 import java.io.InterruptedIOException;
 import java.net.*;
@@ -12,40 +12,88 @@ import javax.sound.sampled.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-// Suppress resource warnings: `speakers` and `socket` are long-lived resources
-// managed by this class (opened in constructor, closed in stopReceiving()).
+/**
+ * Handles audio capture, encoding, transmission, reception, and playback.
+ * <p>
+ * Manages separate threads for sending captured audio to the server and
+ * receiving/playing audio from other clients. Implements jitter buffering
+ * for smooth playback.
+ * </p>
+ */
 @SuppressWarnings("resource")
 public class AudioHandler {
+    /** The server's IP address for audio transmission. */
     private final InetAddress serverAddress;
+    
+    /** The UDP port number on the server for audio packets. */
     private final int serverUdpPort;
+    
+    /** The client ID assigned by the server. */
     private volatile int assignedClientId;
+    
+    /** Atomic boolean controlling the mute state of this client. */
     private final AtomicBoolean isMute;
 
+    /** Logger for this class. */
     private static final Logger logger = Logger.getLogger(AudioHandler.class.getName());
 
+    /** Audio sample rate in Hz. */
     private static final float SAMPLE_RATE = 8000.0F;
+    
+    /** Audio sample size in bits. */
     private static final int SAMPLE_SIZE_IN_BITS = 16;
+    
+    /** Number of audio channels (1 = mono). */
     private static final int CHANNELS = 1;
+    
+    /** Whether audio samples are signed. */
     private static final boolean SIGNED = true;
-    private static final boolean BIG_ENDIAN = false; // Audio format is set to Little-Endian
-    private static final int BUFFER_SIZE = 320; // 20ms of audio (8000 * 0.02 * 2 bytes/sample)
+    
+    /** Whether audio data uses big-endian byte order. */
+    private static final boolean BIG_ENDIAN = false;
+    
+    /** Size of audio buffer in bytes. */
+    private static final int BUFFER_SIZE = 320;
 
+    /** The audio format configuration. */
     private final AudioFormat format;
-    private Thread sendThread, receiveThread, playbackThread;
+    
+    /** Thread for sending audio. */
+    private Thread sendThread;
+    
+    /** Thread for receiving audio packets. */
+    private Thread receiveThread;
+    
+    /** Thread for playing back received audio. */
+    private Thread playbackThread;
+    
+    /** Flag indicating whether audio streaming is active. */
     private volatile boolean isRunning = true;
     
-    // Use a single bound DatagramSocket for both sending and receiving
+    /** The UDP socket for sending and receiving audio packets. */
     private final DatagramSocket socket; 
     
-    // Use ConcurrentSkipListMap for thread-safe, sorted Jitter Buffer by Sequence Number
+    /** Jitter buffers for each client, storing audio packets ordered by sequence number. */
     private final ConcurrentHashMap<Integer, ConcurrentSkipListMap<Long, byte[]>> jitterBuffers = new ConcurrentHashMap<>();
+    
+    /** The audio output line for playback. */
     private final SourceDataLine speakers;
 
+    /**
+     * Constructs an AudioHandler with the specified parameters.
+     * 
+     * @param serverAddress the server's inet address
+     * @param serverUdpPort the UDP port for audio transmission
+     * @param socket the DatagramSocket for sending/receiving audio
+     * @param initialClientId the client's assigned ID
+     * @param isMute atomic boolean controlling mute state
+     * @throws LineUnavailableException if audio line cannot be opened
+     */
     public AudioHandler(InetAddress serverAddress, int serverUdpPort, DatagramSocket socket, int initialClientId, AtomicBoolean isMute) throws LineUnavailableException {
         this.serverAddress = serverAddress;
         this.serverUdpPort = serverUdpPort;
         this.socket = socket;
-        this.assignedClientId = initialClientId; // may be -1 until registered
+        this.assignedClientId = initialClientId;
         this.isMute = isMute;
 
         format = new AudioFormat(SAMPLE_RATE, SAMPLE_SIZE_IN_BITS, CHANNELS, SIGNED, BIG_ENDIAN);
@@ -55,21 +103,36 @@ public class AudioHandler {
         speakers.start();
     }
     
-    // Method to get the local port for the REGISTER command
+    /**
+     * Returns the local UDP port used by this audio handler.
+     * 
+     * @return the local port number
+     */
     public int getLocalPort() {
         return socket.getLocalPort();
     }
 
+    /**
+     * Sets the client ID assigned by the server.
+     * 
+     * @param id the client ID to assign
+     */
     public void setAssignedClientId(int id) {
         this.assignedClientId = id;
     }
 
+    /**
+     * Starts the audio streaming thread to capture and send audio to the server.
+     */
     public void startStreaming() {
         isRunning = true;
         sendThread = new Thread(this::audioSender, "AudioSender");
         sendThread.start();
     }
 
+    /**
+     * Starts the receiving and playback threads for incoming audio from other clients.
+     */
     public void startReceiving() {
         receiveThread = new Thread(this::audioReceiver, "AudioReceiver");
         receiveThread.start();
@@ -77,6 +140,9 @@ public class AudioHandler {
         playbackThread.start();
     }
 
+    /**
+     * Stops the audio streaming thread and waits for it to terminate.
+     */
     public void stopStreaming() {
         isRunning = false;
         if (sendThread != null) {
@@ -88,6 +154,9 @@ public class AudioHandler {
         }
     }
 
+    /**
+     * Stops the receiving and playback threads, closes audio resources, and closes the socket.
+     */
     @SuppressWarnings("resource")
     public void stopReceiving() {
         isRunning = false;
@@ -120,7 +189,13 @@ public class AudioHandler {
         }
     }
 
-    // AudioSender is modified to adhere to the UDP header structure and mute logic
+    /**
+     * Captures audio from the microphone and sends it to the server.
+     * <p>
+     * Implements the UDP header structure with client ID, sequence number, and audio length.
+     * Respects mute state and sends keepalive packets when muted.
+     * </p>
+     */
     private void audioSender() {
         DataLine.Info mic = new DataLine.Info(TargetDataLine.class, format);
         try (TargetDataLine microphone = (TargetDataLine) AudioSystem.getLine(mic)) {
@@ -161,7 +236,7 @@ public class AudioHandler {
                         lastSendTime = System.currentTimeMillis();
                     }
                 } else {
-                    // NAT Keepalive Logic: Send a packet every 15-30s if idle (Mute)
+                    // Send a packet every 15-30s if idle (Mute)
                     if (System.currentTimeMillis() - lastSendTime > 15000) { // 15 seconds
                          // Send a keepalive packet (header only, audioLength = 0)
                         ByteBuffer headerBuffer = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN);
@@ -196,7 +271,13 @@ public class AudioHandler {
         }
     }
 
-    // audioReceiver is modified to unpack the 10-byte header and use TreeMap
+    /**
+     * Receives audio packets from the server and stores them in jitter buffers.
+     * <p>
+     * Unpacks the 10-byte UDP header (client ID, sequence number, audio length)
+     * and stores audio data in per-client jitter buffers ordered by sequence number.
+     * </p>
+     */
     private void audioReceiver() {
         byte[] buffer = new byte[65535]; 
         while (isRunning) {
@@ -251,7 +332,13 @@ public class AudioHandler {
         }
     }
 
-    // audioPlayback is modified to retrieve packets in order from the TreeMap
+    /**
+     * Retrieves audio packets from jitter buffers and plays them through speakers.
+     * <p>
+     * Implements jitter buffering by waiting for a threshold of packets before playback.
+     * Processes packets in sequence number order for smooth audio output.
+     * </p>
+     */
     private void audioPlayback() {
         // ~20ms playback interval
         final int PLAYBACK_INTERVAL_MS = (int)(BUFFER_SIZE * 1000 / (SAMPLE_RATE * SAMPLE_SIZE_IN_BITS/8)); 

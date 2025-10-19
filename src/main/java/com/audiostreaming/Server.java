@@ -1,4 +1,4 @@
-package com.example;
+package com.audiostreaming;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -20,6 +20,25 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+/**
+ * Audio streaming server that forwards UDP audio frames between clients and
+ * maintains a TCP control channel for registration, presence, and commands
+ * such as JOIN, LEAVE, MUTE, and UNMUTE.
+ * <p>
+ * Responsibilities:
+ * <ul>
+ *   <li>Accept TCP connections and register clients, assigning incremental IDs</li>
+ *   <li>Track client presence and state (ACTIVE, MUTED, LEFT, DISCONNECTED)</li>
+ *   <li>Receive UDP audio packets from senders and forward in-order frames to other clients</li>
+ *   <li>Run periodic heartbeats to detect stale TCP connections and time out inactive clients</li>
+ * </ul>
+ * Concurrency model:
+ * <ul>
+ *   <li>One thread accepting TCP control connections</li>
+ *   <li>One background scheduler for heartbeats and cleanup</li>
+ *   <li>A worker pool for UDP packet processing and forwarding</li>
+ * </ul>
+ */
 public class Server{
     private final DatagramSocket socket; 
     private static final Logger logger = Logger.getLogger(Server.class.getName());
@@ -44,6 +63,12 @@ public class Server{
     // tcp acceptor socket
     private ServerSocket tcpServerSocket;
 
+    /**
+     * Creates a server instance bound to the provided UDP socket.
+     *
+     * @param socket the UDP socket used to receive and forward audio packets
+     * @throws Exception if initialization fails
+     */
     public Server(DatagramSocket socket) throws Exception{
         this.clientStates = new ConcurrentHashMap<>();
         this.socket = socket;
@@ -63,6 +88,15 @@ public class Server{
     }
 
 
+    /**
+     * Starts the TCP control server, binding to port 4444 by default.
+     * <p>
+     * If port 4444 is unavailable, the server falls back to an ephemeral port
+     * assigned by the OS. The actual port in use can be queried via {@link #getTcpPort()}.
+     * </p>
+     *
+     * @throws Exception if the server socket cannot be created or bound
+     */
     public void startTCPServer() throws Exception{
         // default binding to port 4444
         // create an unbound ServerSocket so we can set SO_REUSEADDR before binding
@@ -80,8 +114,14 @@ public class Server{
     }
 
     /**
-     * Start TCP acceptor using a pre-bound ServerSocket. This allows callers to bind to an
-     * ephemeral port and pass the socket in (useful for in-process local testing).
+     * Starts the TCP acceptor loop using the provided, pre-bound server socket.
+     * <p>
+     * Useful for tests that need to bind to an ephemeral port first and then delegate to the
+     * server to run the accept loop.
+     * </p>
+     *
+     * @param providedSocket a server socket that is already created and bound
+     * @throws Exception if the accept loop fails to start or runtime errors occur
      */
     public void startTCPServer(ServerSocket providedSocket) throws Exception {
         this.tcpServerSocket = providedSocket;
@@ -106,7 +146,10 @@ public class Server{
     }
 
     /**
-     * Accept loop that assumes tcpServerSocket is already created and bound.
+     * Accept loop for TCP control connections; assumes {@code tcpServerSocket} is initialized
+     * and bound. Spawns a {@code ControlHandler} per accepted client.
+     *
+     * @throws Exception if the accept loop encounters unrecoverable errors
      */
     private void tcpAcceptLoop() throws Exception {
         try {
@@ -137,6 +180,16 @@ public class Server{
         }
     }
 
+    /**
+     * Periodic maintenance task that:
+     * <ul>
+     *   <li>Marks clients DISCONNECTED after a timeout with no UDP packets</li>
+     *   <li>Removes long-disconnected clients after a grace period</li>
+     *   <li>Sends a lightweight heartbeat over TCP to detect closed client sockets</li>
+     * </ul>
+     *
+     * @throws Exception on I/O or scheduling errors
+     */
     public void heartbeat() throws Exception{
     long now = System.currentTimeMillis();
         for (Map.Entry<Integer, ClientState> e : clientStates.entrySet()) {
@@ -184,6 +237,14 @@ public class Server{
         }
     }
 
+    /**
+     * Receives UDP packets from clients in a loop and dispatches processing to the worker pool.
+     * <p>
+     * Exits gracefully when the UDP socket is closed as part of shutdown.
+     * </p>
+     *
+     * @throws Exception if UDP receive or task submission fails
+     */
     public void udpReceive() throws Exception{ 
         try {
             while (!Thread.currentThread().isInterrupted() && !socket.isClosed()) {
@@ -224,6 +285,10 @@ public class Server{
         }
     }
 
+    /**
+     * Stops the server, closing TCP and UDP sockets, terminating background tasks,
+     * and clearing client state/mappings.
+     */
     public void stop() {
     logger.info("[SERVER] - Stopping server...");
         // close tcp acceptor first so accept loop can exit
@@ -259,6 +324,15 @@ public class Server{
     }
 
 
+    /**
+     * Starts a TCP accept loop by creating and binding a new {@link ServerSocket}.
+     * <p>
+     * Similar to {@link #startTCPServer()}, but performs the bind inside this method
+     * and then runs the accept loop.
+     * </p>
+     *
+     * @throws Exception if binding or accepting connections fails
+     */
     public void tcpConnection() throws Exception{
     // create unbound ServerSocket and set reuse before bind to avoid bind races in tests
     tcpServerSocket = new ServerSocket();
@@ -301,6 +375,11 @@ public class Server{
     }
 
     // Expose the actual TCP listening port (useful for tests when server binds to ephemeral port)
+    /**
+     * Returns the TCP port the control server is currently listening on.
+     *
+     * @return the bound TCP port, or -1 if the TCP server is not running
+     */
     public int getTcpPort() {
         return tcpServerSocket == null ? -1 : tcpServerSocket.getLocalPort();
     }
@@ -469,6 +548,14 @@ public class Server{
         }
     }
 
+    /**
+     * Handles a single control command for the specified client, updating its state
+     * and broadcasting presence or state changes as needed.
+     *
+     * @param command the command string (e.g., MUTE, UNMUTE, JOIN, LEAVE)
+     * @param clientId the target client ID
+     * @throws Exception if command processing encounters an error
+     */
     void handleCommands(String command, int clientId) throws Exception{
         ClientState st = clientStates.get(clientId);
         if (st == null) {
@@ -523,6 +610,15 @@ public class Server{
 
     // helper methods removed — command handling is done in handleCommands()
     
+    /**
+     * Processes a single UDP audio packet: performs basic validation, updates sequencing,
+     * buffers in-order frames, and forwards them to other eligible clients.
+     *
+     * @param data the raw UDP packet bytes
+     * @param srcAddr the source IP address the packet came from
+     * @param srcPort the source UDP port the packet came from
+     * @throws Exception if deserialization or forwarding fails
+     */
     public void processPacket(byte[] data, InetAddress srcAddr, int srcPort) throws Exception {
         System.out.println("[PROCESS] - Enter processPacket: src=" + srcAddr + ":" + srcPort + " size=" + (data==null?0:data.length));
         // Deserialize the audio packet
@@ -643,6 +739,19 @@ public class Server{
 
 
     // 4 byte client ID, 4 bytes sequence number, 2 bytes audio data length, then audio bytes
+    /**
+     * Deserializes an audio packet from the custom 10-byte header plus payload.
+     * <p>
+     * Header layout (big-endian):
+     * <pre>
+     * 4 bytes clientId, 4 bytes sequenceNumber, 2 bytes audioDataLength, followed by audioData
+     * </pre>
+     * </p>
+     *
+     * @param data the raw UDP packet bytes
+     * @return a parsed {@link AudioPacket}
+     * @throws IllegalArgumentException if the packet is malformed
+     */
     AudioPacket deserializeAudioPacket(byte[] data) {
         final int HEADER_SIZE = 10; // 4 (clientId) + 4 (seq) + 2 (len)
         if (data == null || data.length < HEADER_SIZE) {
@@ -669,6 +778,12 @@ public class Server{
         return new AudioPacket(clientId, sequenceNumber, audioData);
     }
 
+    /**
+     * Serializes an {@link AudioPacket} into the custom header + payload format.
+     *
+     * @param pkt the packet to serialize
+     * @return bytes suitable for sending via UDP
+     */
     byte[] serializeAudioPacket(AudioPacket pkt) {
         final int HEADER_SIZE = 10;
         byte[] data = new byte[HEADER_SIZE + pkt.audioData.length];
@@ -690,6 +805,14 @@ public class Server{
     }
 
     // Compare addresses with a small tolerance for IPv4/IPv6 loopback differences.
+    /**
+     * Compares two IP addresses with tolerance for loopback variants.
+     * Treats IPv4 127.0.0.1 and IPv6 ::1 as equivalent; otherwise requires exact match.
+     *
+     * @param a first address
+     * @param b second address
+     * @return true if considered equivalent, otherwise false
+     */
     private boolean addressesMatch(InetAddress a, InetAddress b) {
         if (a == null || b == null) return false;
         // Treat IPv4 loopback 127.0.0.1 and IPv6 loopback ::1 as equivalent
@@ -708,6 +831,9 @@ public class Server{
 }
 
 
+/**
+ * Per-client state tracked by the server for presence and forwarding decisions.
+ */
 class ClientState {
     int clientId; 
     int clientPort; 
@@ -721,12 +847,22 @@ class ClientState {
 }
 
 
+/**
+ * Simple audio packet model used internally by the server for buffering/forwarding.
+ */
 class AudioPacket {
     public int clientId;
     public int sequenceNumber;
     public byte[] audioData;
     public long timestamp;
 
+    /**
+     * Constructs an audio packet instance.
+     *
+     * @param clientId the sender client ID
+     * @param sequenceNumber the sequence number of the audio frame
+     * @param audioData the audio payload bytes
+     */
     public AudioPacket(int clientId, int sequenceNumber, byte[] audioData) {
         this.clientId = clientId;
         this.sequenceNumber = sequenceNumber;
@@ -735,6 +871,9 @@ class AudioPacket {
     }
 }
 
+/**
+ * Enumerates possible client states used by the server.
+ */
 enum ClientStatus {
     ACTIVE,
     MUTED,

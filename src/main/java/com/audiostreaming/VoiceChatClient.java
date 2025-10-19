@@ -1,4 +1,4 @@
-package com.example;
+package com.audiostreaming;
 import java.net.*;
 import java.io.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -6,10 +6,16 @@ import javax.sound.sampled.LineUnavailableException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+/**
+ * Voice chat client that manages TCP control channel and UDP audio streaming.
+ * <p>
+ * Handles connection to the server, registration, audio capture/playback,
+ * and state management (mute, join/leave).
+ * </p>
+ */
 public class VoiceChatClient {
     private static final Logger logger = Logger.getLogger(VoiceChatClient.class.getName());
 
-    // instance-configurable server connection info (defaults kept for convenience)
     private final String serverIp;
     private final int tcpPort;
     private final int serverUdpPort;
@@ -25,11 +31,12 @@ public class VoiceChatClient {
     private final AtomicBoolean isMute = new AtomicBoolean(false);
     private String username = "Guest";
 
-    // allow UI to receive raw server messages (PRESENCE etc.)
     private java.util.function.Consumer<String> serverMessageListener;
 
     /**
-     * Expose ability for callers to remove the previously added listener.
+     * Removes a previously added server message listener.
+     * 
+     * @param listener the listener to remove
      */
     public void removeServerMessageListener(java.util.function.Consumer<String> listener) {
         if (listener == null) return;
@@ -40,30 +47,39 @@ public class VoiceChatClient {
     }
 
     /**
-     * Return the currently assigned client id (or -1 if none).
+     * Returns the client ID assigned by the server.
+     * 
+     * @return the assigned client ID, or -1 if not assigned
      */
     public int getAssignedClientId() {
         if (tcpChannel != null) return tcpChannel.getClientId();
         return -1;
     }
 
+    /**
+     * Creates a VoiceChatClient with default connection parameters.
+     */
     public VoiceChatClient() {
         this("127.0.0.1", 4444, 5555);
     }
 
+    /**
+     * Creates a VoiceChatClient with specified connection parameters.
+     * 
+     * @param serverIp the server IP address
+     * @param tcpPort the TCP control port
+     * @param serverUdpPort the UDP audio port
+     */
     public VoiceChatClient(String serverIp, int tcpPort, int serverUdpPort) {
         this.serverIp = serverIp;
         this.tcpPort = tcpPort;
         this.serverUdpPort = serverUdpPort;
         try {
-            // Prepare control channel (clientId will be assigned by server)
             tcpChannel = new TcpControlChannel(this.serverIp, this.tcpPort, -1);
             serverAddr = InetAddress.getByName(this.serverIp);
-            // Don't create AudioHandler yet; we'll create it after REGISTER completes and we have assigned id
         } catch (UnknownHostException e) {
             logger.log(Level.SEVERE, "Initialization Error: " + e.getMessage(), e);
         }
-        // Ensure we cleanup if the JVM exits unexpectedly
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 leaveSession();
@@ -71,9 +87,11 @@ public class VoiceChatClient {
         }, "voicechat-shutdown-hook"));
     }
 
+    /**
+     * Joins the voice chat session by registering with the server and starting audio.
+     */
     public void joinSession() {
         try {
-            // 1. Create UDP socket bound to any free port
             udpSocket = new DatagramSocket(0);
             localUdpPort = udpSocket.getLocalPort();
 
@@ -85,13 +103,10 @@ public class VoiceChatClient {
 
             logger.info("Connected to TCP. Preparing to send REGISTER command....");
 
-            // If a UI or other listener was registered before joinSession, make sure the TcpControlChannel
-            // has it so it can receive the OK and PRESENCE messages that arrive immediately after REGISTER.
             if (serverMessageListener != null) {
                 tcpChannel.addServerListener(serverMessageListener);
             }
 
-            // 2. Send REGISTER and wait synchronously for assigned id
             int assignedId = tcpChannel.registerAndWait(localUdpPort, username, 3000);
             if (assignedId < 0) {
                 logger.severe("Failed to register with server (no OK reply).");

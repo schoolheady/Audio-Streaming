@@ -1,46 +1,68 @@
-package com.example;
+package com.audiostreaming;
 import java.io.*;
 import java.net.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
- 
 import java.util.concurrent.atomic.AtomicBoolean;
 
+/**
+ * Manages the TCP control channel for communication with the server.
+ * <p>
+ * Handles registration, sending commands (MUTE, UNMUTE, JOIN, LEAVE),
+ * and receiving server messages (OK, PRESENCE, etc.).
+ * </p>
+ */
 public class TcpControlChannel {
     private Socket socket;
     private PrintWriter out;
     private BufferedReader in;
     private final String serverIp;
     private final int port;
-    private int clientId; // clientId can be changed after REGISTER
+    private int clientId;
     private Thread listenerThread;
     private final AtomicBoolean isConnected = new AtomicBoolean(false);
-    // queue used by registerAndWait to receive assigned id from listener
     private final BlockingQueue<Integer> registerQueue = new ArrayBlockingQueue<>(1);
     private final CopyOnWriteArrayList<Consumer<String>> serverListeners = new CopyOnWriteArrayList<>();
 
+    /**
+     * Constructs a TcpControlChannel with the specified server connection details.
+     * 
+     * @param serverIp the server IP address
+     * @param port the TCP port number
+     * @param clientId the initial client ID (-1 if not yet assigned)
+     */
     public TcpControlChannel(String serverIp, int port, int clientId) {
         this.serverIp = serverIp;
         this.port = port;
         this.clientId = clientId;
     }
 
+    /**
+     * Returns the assigned client ID.
+     * 
+     * @return the client ID
+     */
     public int getClientId() {
         return clientId;
     }
 
+    /**
+     * Sets a new client ID.
+     * 
+     * @param newId the new client ID
+     */
     public void setClientId(int newId) {
         this.clientId = newId;
     }
 
     /**
      * Establishes a connection to the TCP server and starts the listener thread.
-     * @return true if connection is successful, false otherwise.
+     * 
+     * @return true if connection is successful, false otherwise
      */
     public boolean connect() {
-        // If already connected, return true (idempotent)
         if (isConnected.get() && socket != null && !socket.isClosed()) return true;
         try {
             socket = new Socket(serverIp, port);
@@ -48,7 +70,6 @@ public class TcpControlChannel {
             in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
             isConnected.set(true);
 
-            // Starts TCP response listening stream
             listenerThread = new Thread(this::tcpListener, "TCP-Listener");
             listenerThread.start();
 
@@ -140,7 +161,7 @@ public class TcpControlChannel {
     }
 
     /**
-     * Send REGISTER and block until the server replies with OK <id> or timeout.
+     * Send REGISTER and block until the server replies with OK &lt;id&gt; or timeout.
      * Returns assigned id or -1 on timeout/failure.
      */
     public int registerAndWait(int udpPort, long timeoutMs) {

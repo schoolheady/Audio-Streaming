@@ -2,6 +2,10 @@ package com.example;
 
 import org.junit.jupiter.api.Test;
 
+import com.audiostreaming.AudioPacket;
+import com.audiostreaming.ClientState;
+import com.audiostreaming.Server;
+
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.InputStreamReader;

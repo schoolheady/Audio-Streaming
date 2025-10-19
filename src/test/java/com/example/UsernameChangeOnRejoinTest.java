@@ -1,6 +1,10 @@
 package com.example;
 
 import org.junit.jupiter.api.Test;
+
+import com.audiostreaming.AudioStreamingUI;
+import com.audiostreaming.VoiceChatClient;
+
 import javax.swing.*;
 import java.util.function.Consumer;
 

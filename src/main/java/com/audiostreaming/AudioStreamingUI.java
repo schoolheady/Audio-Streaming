@@ -1,4 +1,4 @@
-package com.example;
+package com.audiostreaming;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
@@ -6,6 +6,13 @@ import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 
+/**
+ * Discord-like voice chat UI built with Swing.
+ * <p>
+ * Provides a graphical interface for connecting to the audio server,
+ * joining voice calls, managing username, and controlling microphone mute state.
+ * </p>
+ */
 public class AudioStreamingUI {
 
     private JLabel channelTitleLabel;
@@ -19,14 +26,15 @@ public class AudioStreamingUI {
     private boolean joined = false;
     private VoiceChatClient client;
     private java.util.function.Consumer<String> uiServerListener;
-    // map server-assigned client id -> username (used to remove by id)
     private final java.util.Map<Integer, String> idToName = new java.util.concurrent.ConcurrentHashMap<>();
-    // our assigned client id once server replies with OK <id>
     private int myAssignedId = -1;
 
     private JButton joinButton;
     private JButton leaveButton;
 
+    /**
+     * Displays the voice chat UI window.
+     */
     public void showUI() {
         frame = new JFrame("Discord-like Voice Server");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
@@ -36,44 +44,82 @@ public class AudioStreamingUI {
         frame.setVisible(true);
     }
 
-    // --- Test helpers -------------------------------------------------
     /**
-     * Initialize UI components without showing the window. Useful for tests.
+     * Initializes UI components without showing the window (for testing).
      */
     public void initForTests() {
-        // buildRoot populates all component fields
         buildRoot();
     }
 
+    /**
+     * Sets the client instance for testing.
+     * 
+     * @param c the VoiceChatClient instance
+     * @param connected whether the client is connected
+     */
     public void setClientForTests(VoiceChatClient c, boolean connected) {
         this.client = c;
         this.connected = connected;
     }
 
+    /**
+     * Sets the username field value for testing.
+     * 
+     * @param username the username to set
+     */
     public void setUsernameForTests(String username) {
         if (this.usernameField == null) initForTests();
         this.usernameField.setText(username);
     }
 
+    /**
+     * Triggers the join call action for testing.
+     */
     public void callJoin() { joinCall(); }
+    
+    /**
+     * Triggers the leave server action for testing.
+     */
     public void callLeave() { leaveServer(); }
 
+    /**
+     * Returns the user model for testing.
+     * 
+     * @return the DefaultListModel containing participant names
+     */
     public DefaultListModel<String> getUserModelForTests() {
         if (this.userModel == null) initForTests();
         return this.userModel;
     }
 
+    /**
+     * Sets the user model for testing.
+     * 
+     * @param model the DefaultListModel to use
+     */
     public void setUserModelForTests(DefaultListModel<String> model) {
         if (this.userList == null) initForTests();
         this.userModel = model;
         this.userList.setModel(model);
     }
 
+    /**
+     * Sets the joined state for testing.
+     * 
+     * @param j whether the user is joined
+     */
     public void setJoinedForTests(boolean j) { this.joined = j; }
-    // ------------------------------------------------------------------
 
-    // Test helper: toggle mute programmatically and return the label text
+    /**
+     * Toggles mute state for testing.
+     */
     public void callToggleMute() { toggleMute(); }
+    
+    /**
+     * Returns the mute label text for testing.
+     * 
+     * @return the current mute label text
+     */
     public String getMuteLabelTextForTests() { return muteLabel == null ? null : muteLabel.getText(); }
 
     private JPanel buildRoot() {
@@ -361,14 +407,10 @@ public class AudioStreamingUI {
                     }
                     final String finalName = name;
                     final int finalId = id;
-                    // Ensure UI updates happen on EDT; only add if name not already present
                     SwingUtilities.invokeLater(() -> {
                         if (!joined) return; // ignore late events after leaving
                         
-                        // Skip adding our own entry from PRESENCE broadcasts - we already show "(You)"
                         if (finalId == myAssignedId && myAssignedId > 0) {
-                            // This is our own presence - update the idToName mapping but don't add to list
-                            // (the OK handler already added us with "(You)")
                             System.out.println("[UI] - Skipping PRESENCE ADD for own ID: " + finalId + " (name: " + finalName + ")");
                             return;
                         }
@@ -405,17 +447,12 @@ public class AudioStreamingUI {
                     SwingUtilities.invokeLater(() -> {
                         if (!joined) return; // ignore late events after leaving
                         
-                        // If we don't have a name for this ID, it might be a stale entry or our own ID
-                        // In that case, try to remove by checking if any entry matches this ID
                         if (name == null && finalId > 0) {
-                            // This might be our own disconnect or a client we didn't track properly
-                            // Just log and skip - we shouldn't have entries for unknown IDs anyway
                             System.out.println("[UI] - Received PRESENCE REMOVE for unknown ID: " + finalId);
                             return;
                         }
                         
                         if (name != null) {
-                            // remove both plain name and '(You)' variant
                             for (int i = userModel.size() - 1; i >= 0; i--) {
                                 String v = userModel.get(i);
                                 if (v != null && (v.equals(name) || v.equals(name + " (You)"))) {
@@ -427,7 +464,6 @@ public class AudioStreamingUI {
                     });
                 }
             } else if (line.startsWith("OK ")) {
-                // Server assigned id; record our id->name mapping
                 SwingUtilities.invokeLater(() -> {
                     if (!joined) return; // ignore OK if we've already left
                     // When we get OK <id>, map the id to our username and ensure '(You)' display
@@ -465,7 +501,6 @@ public class AudioStreamingUI {
             }
         };
         client.addServerMessageListener(safeListener);
-        // keep uiServerListener pointing at the safe wrapper so removal works
         uiServerListener = safeListener;
 
         client.joinSession();
@@ -486,7 +521,6 @@ public class AudioStreamingUI {
         if (joinButton != null) joinButton.setVisible(false);
         
         try {
-            // CRITICAL: Set joined = false FIRST to prevent any late PRESENCE messages from being processed
             joined = false;
             
             // Copy reference to avoid races
@@ -502,12 +536,10 @@ public class AudioStreamingUI {
             } catch (Exception ignored) {}
             uiServerListener = null;
             
-            // Now safely clear UI state
             userModel.clear();
             userModel.addElement(" Disconnected");
             connected = false;
             
-            // Clear idToName mapping and reset our assigned ID to avoid stale entries on reconnect/rejoin
             idToName.clear();
             myAssignedId = -1;
             
@@ -524,7 +556,7 @@ public class AudioStreamingUI {
 
             JOptionPane.showMessageDialog(frame, "Disconnected from server.");
         } catch (RuntimeException re) {
-            // Protect the EDT: show an error message instead of letting the exception propagate
+            // show an error message 
             System.err.println("[UI] - Runtime error during disconnect: " + re.getMessage());
             JOptionPane.showMessageDialog(frame, "An error occurred while disconnecting: " + re.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
         }

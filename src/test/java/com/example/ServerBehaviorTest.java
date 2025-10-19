@@ -2,6 +2,11 @@ package com.example;
 
 import org.junit.jupiter.api.Test;
 
+import com.audiostreaming.AudioPacket;
+import com.audiostreaming.ClientState;
+import com.audiostreaming.ClientStatus;
+import com.audiostreaming.Server;
+
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 

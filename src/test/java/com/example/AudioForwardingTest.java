@@ -1,6 +1,11 @@
 package com.example;
 
 import org.junit.jupiter.api.Test;
+
+import com.audiostreaming.AudioPacket;
+import com.audiostreaming.Server;
+import com.audiostreaming.TcpControlChannel;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.net.DatagramPacket;
