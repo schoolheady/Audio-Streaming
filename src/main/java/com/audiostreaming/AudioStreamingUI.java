@@ -21,7 +21,8 @@ public class AudioStreamingUI {
     private JLabel muteLabel;
     private DefaultListModel<String> userModel;
     private JList<String> userList;
-    private boolean muted = true;
+    // Start unmuted to match client default
+    private boolean muted = false;
     private boolean connected = false;
     private boolean joined = false;
     private VoiceChatClient client;
@@ -31,6 +32,8 @@ public class AudioStreamingUI {
 
     private JButton joinButton;
     private JButton leaveButton;
+    private JButton muteButton; // store reference to disable/enable during toggle
+    private volatile boolean awaitingMuteAck = false;
 
     /**
      * Displays the voice chat UI window.
@@ -278,8 +281,9 @@ public class AudioStreamingUI {
         // also force left alignment for mute panel
         mutePanel.setAlignmentX(Component.LEFT_ALIGNMENT);
 
-        JButton muteBtn = styledButton("Toggle Mute", new Color(75, 130, 246));
-        muteBtn.addActionListener(e -> toggleMute());
+    JButton muteBtn = styledButton("Toggle Mute", new Color(75, 130, 246));
+    this.muteButton = muteBtn;
+    muteBtn.addActionListener(e -> toggleMute());
 
         muteLabel = new JLabel("", loadIcon("mic.png", 22, 22), JLabel.LEFT);
         muteLabel.setFont(new Font("Segoe UI", Font.BOLD, 15));
@@ -458,6 +462,38 @@ public class AudioStreamingUI {
                         }
                     });
                 }
+            } else if (line.startsWith("MUTE ")) {
+                String[] parts = line.split(" ");
+                if (parts.length >= 2) {
+                    int id = -1;
+                    try { id = Integer.parseInt(parts[1]); } catch (NumberFormatException ignored) {}
+                    final int finalId = id;
+                    SwingUtilities.invokeLater(() -> {
+                        if (!joined) return;
+                        if (finalId == myAssignedId && myAssignedId > 0) {
+                            muted = true;
+                            awaitingMuteAck = false;
+                            updateMuteStatus();
+                            if (muteButton != null) muteButton.setEnabled(true);
+                        }
+                    });
+                }
+            } else if (line.startsWith("UNMUTE ")) {
+                String[] parts = line.split(" ");
+                if (parts.length >= 2) {
+                    int id = -1;
+                    try { id = Integer.parseInt(parts[1]); } catch (NumberFormatException ignored) {}
+                    final int finalId = id;
+                    SwingUtilities.invokeLater(() -> {
+                        if (!joined) return;
+                        if (finalId == myAssignedId && myAssignedId > 0) {
+                            muted = false;
+                            awaitingMuteAck = false;
+                            updateMuteStatus();
+                            if (muteButton != null) muteButton.setEnabled(true);
+                        }
+                    });
+                }
             } else if (line.startsWith("PRESENCE REMOVE ")) {
                 String[] parts = line.split(" ");
                 if (parts.length >= 3) {
@@ -585,23 +621,25 @@ public class AudioStreamingUI {
     }
 
     private void toggleMute() {
-        muted = !muted;
-        updateMuteStatus();
         if (client == null) {
             JOptionPane.showMessageDialog(frame, "Client is not connected. Please reconnect.");
             return;
         }
+        if (awaitingMuteAck) return; // prevent double taps
+        awaitingMuteAck = true;
+        if (muteButton != null) muteButton.setEnabled(false);
+        // Do not flip UI state yet; wait for server MUTE/UNMUTE to arrive
         client.toggleMute();
     }
 
     private void updateMuteStatus() {
         if (muted) {
             muteLabel.setIcon(loadIcon("mute.png", 22, 22));
-            muteLabel.setText("Mute: OFF");
+            muteLabel.setText("Mic: Muted");
             muteLabel.setForeground(Color.RED);
         } else {
             muteLabel.setIcon(loadIcon("mic.png", 22, 22));
-            muteLabel.setText("Mute: ON");
+            muteLabel.setText("Mic: Live");
             muteLabel.setForeground(new Color(0, 200, 0));
         }
     }
