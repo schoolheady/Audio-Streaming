@@ -60,7 +60,7 @@ public class VoiceChatClient {
      * Creates a VoiceChatClient with default connection parameters.
      */
     public VoiceChatClient() {
-        this("127.0.0.1", 4444, 5555);
+        this("10.178.27.169", 4444, 5555);
     }
 
     /**

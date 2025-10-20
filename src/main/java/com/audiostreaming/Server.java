@@ -126,6 +126,32 @@ public class Server{
     public void startTCPServer(ServerSocket providedSocket) throws Exception {
         this.tcpServerSocket = providedSocket;
         logger.info("[SERVER] - Server starting TCP acceptor");
+        
+        // Show all IP addresses the server is listening on
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> interfaces = java.net.NetworkInterface.getNetworkInterfaces();
+            System.out.println("==============================================");
+            System.out.println("[SERVER] - Server is running on the following IP addresses:");
+            System.out.println("[SERVER] - TCP Port: " + tcpServerSocket.getLocalPort());
+            System.out.println("[SERVER] - UDP Port: " + socket.getLocalPort());
+            System.out.println("----------------------------------------------");
+            while (interfaces.hasMoreElements()) {
+                java.net.NetworkInterface iface = interfaces.nextElement();
+                if (iface.isUp() && !iface.isLoopback()) {
+                    java.util.Enumeration<java.net.InetAddress> addrs = iface.getInetAddresses();
+                    while (addrs.hasMoreElements()) {
+                        InetAddress addr = addrs.nextElement();
+                        if (!addr.isLoopbackAddress() && !addr.isLinkLocalAddress()) {
+                            System.out.println("[SERVER] - " + addr.getHostAddress());
+                        }
+                    }
+                }
+            }
+            System.out.println("==============================================");
+        } catch (Exception e) {
+            System.out.println("[SERVER] - Could not enumerate IP addresses: " + e.getMessage());
+        }
+        
         logger.info("[TCP] - Listening for TCP clients on port " + tcpServerSocket.getLocalPort());
 
         new Thread(() -> {
@@ -493,7 +519,11 @@ public class Server{
                     if (entry.getKey().equals(clientId)) continue;
                     ClientState cs = entry.getValue();
                     if (cs != null && (cs.status == ClientStatus.ACTIVE || cs.status == ClientStatus.MUTED)) {
-                        writer.write("PRESENCE ADD " + cs.clientId + " " + (cs.username == null ? "" : cs.username) + "\n");
+                        String msg = "PRESENCE ADD " + cs.clientId + " " + (cs.username == null ? "" : cs.username);
+                        writer.write(msg + "\n");
+                        logger.info("[TCP] - Sent to clientId=" + clientId + ": " + msg);
+                    } else if (cs != null) {
+                        logger.info("[TCP] - Skipped sending PRESENCE ADD for clientId=" + cs.clientId + " (status=" + cs.status + ") to clientId=" + clientId);
                     }
                 }
                 writer.flush();

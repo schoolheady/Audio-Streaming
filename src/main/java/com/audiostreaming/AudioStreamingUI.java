@@ -122,7 +122,7 @@ public class AudioStreamingUI {
      */
     public String getMuteLabelTextForTests() { return muteLabel == null ? null : muteLabel.getText(); }
 
-    private JPanel buildRoot() {
+    private JPanel buildRoot() { // this is a main function because it is used in the App.java code
         JPanel root = new JPanel(new BorderLayout());
         root.setBackground(new Color(43, 45, 49));
         root.add(buildHeader(), BorderLayout.NORTH);
@@ -328,10 +328,26 @@ public class AudioStreamingUI {
     private void connectToServer() {
         userModel.clear();
         userModel.addElement(" Connect");
+        
+        // Prompt user for server IP address
+        String serverIp = javax.swing.JOptionPane.showInputDialog(
+            frame,
+            "Enter server IP address:",
+            "Connect to Server",
+            javax.swing.JOptionPane.QUESTION_MESSAGE
+        );
+        
+        if (serverIp == null || serverIp.trim().isEmpty()) {
+            userModel.clear();
+            userModel.addElement(" Connection cancelled");
+            return;
+        }
+        
+        serverIp = serverIp.trim();
+        
         // Create client instance and mark connected
         try {
-            // Default to localhost and default ports; could be exposed via UI fields later
-            client = new VoiceChatClient("127.0.0.1", 4444, 5555);
+            client = new VoiceChatClient(serverIp, 4444, 5555);
             // Ensure TCP control is connected (client created but TCP connect happens when joining)
             boolean ok = client.connectControl();
             if (!ok) {
@@ -355,6 +371,9 @@ public class AudioStreamingUI {
         }
         if (joinButton != null) joinButton.setVisible(true);
         JOptionPane.showMessageDialog(frame, "Connected to server successfully!");
+
+        // Automatically join the call after connecting
+        SwingUtilities.invokeLater(() -> joinCall());
     }
 
     private void joinCall() {
@@ -394,6 +413,7 @@ public class AudioStreamingUI {
             // process PRESENCE messages and OK response
             if (line.startsWith("PRESENCE ADD ")) {
                 String[] parts = line.split(" ", 4);
+                System.out.println("[UI] - Received: " + line);
                 if (parts.length >= 3) {
                     String idStr = parts[2];
                     int id = -1;
@@ -408,14 +428,14 @@ public class AudioStreamingUI {
                     final String finalName = name;
                     final int finalId = id;
                     SwingUtilities.invokeLater(() -> {
-                        if (!joined) return; // ignore late events after leaving
-                        
+                        if (!joined) {
+                            System.out.println("[UI] - Ignored PRESENCE ADD after leaving: " + line);
+                            return;
+                        }
                         if (finalId == myAssignedId && myAssignedId > 0) {
                             System.out.println("[UI] - Skipping PRESENCE ADD for own ID: " + finalId + " (name: " + finalName + ")");
                             return;
                         }
-                        
-                        // If this id was previously known under a different name, remove the old entry
                         if (previousName != null && !previousName.equals(finalName)) {
                             System.out.println("[UI] - ID " + finalId + " changed name from '" + previousName + "' to '" + finalName + "'");
                             for (int i = userModel.size() - 1; i >= 0; i--) {
@@ -433,6 +453,8 @@ public class AudioStreamingUI {
                         if (!exists) {
                             userModel.addElement(finalName);
                             System.out.println("[UI] - Added '" + finalName + "' to participants list (ID: " + finalId + ")");
+                        } else {
+                            System.out.println("[UI] - PRESENCE ADD for '" + finalName + "' (ID: " + finalId + ") already in list");
                         }
                     });
                 }
