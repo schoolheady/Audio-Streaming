@@ -16,7 +16,7 @@ public class App {
      * @throws Exception if server/client initialization fails
      */
     public static void main(String[] args) throws Exception {
-        String mode = (args != null && args.length > 0) ? args[0].trim().toLowerCase() : "client";
+        String mode = (args != null && args.length > 0) ? args[0].trim().toLowerCase() : "server";
 
         switch (mode) {
             case "server":

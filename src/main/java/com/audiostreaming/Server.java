@@ -98,15 +98,11 @@ public class Server{
      * @throws Exception if the server socket cannot be created or bound
      */
     public void startTCPServer() throws Exception{
-        // default binding to port 4444
-        // create an unbound ServerSocket so we can set SO_REUSEADDR before binding
         ServerSocket ss = new ServerSocket();
         ss.setReuseAddress(true);
         try {
             ss.bind(new InetSocketAddress(4444));
         } catch (java.net.BindException be) {
-            // If port 4444 is already in use (common in fast test runs), fall back to an
-            // ephemeral port assigned by the OS to avoid test failures due to bind races.
             logger.log(Level.WARNING, "[TCP] - Port 4444 unavailable, falling back to ephemeral port", be);
             ss.bind(new InetSocketAddress(0));
         }
@@ -541,9 +537,22 @@ public class Server{
                     try {
                         line = reader.readLine();
                         if (line == null) break; // client closed
-                        logger.fine("[TCP] - Received command from " + clientId + ": " + line);
+                        String cmd = line.trim();
+                        logger.fine("[TCP] - Received command from " + clientId + ": " + cmd);
                         try {
-                            handleCommands(line.trim(), clientId);
+                            if ("SYNC".equals(cmd)) {
+                                // Respond only to this client with current ACTIVE/MUTED presence
+                                for (Map.Entry<Integer, ClientState> entry : clientStates.entrySet()) {
+                                    if (entry.getKey().equals(clientId)) continue; // skip self
+                                    ClientState cs = entry.getValue();
+                                    if (cs != null && (cs.status == ClientStatus.ACTIVE || cs.status == ClientStatus.MUTED)) {
+                                        writer.write("PRESENCE ADD " + cs.clientId + " " + (cs.username == null ? "" : cs.username) + "\n");
+                                    }
+                                }
+                                writer.flush();
+                            } else {
+                                handleCommands(cmd, clientId);
+                            }
                         } catch (Exception e) {
                             logger.log(Level.WARNING, "[TCP] - Error handling command from " + clientId, e);
                         }

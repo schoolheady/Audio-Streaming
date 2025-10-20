@@ -1,5 +1,5 @@
 # Audio-Streaming
-Java-based multi-client audio streaming app using UDP for real-time audio and TCP for control. Users can join sessions, talk, self-mute, or mute others.
+Java-based multi-client audio streaming app using UDP for real-time audio and TCP for control. Users can join sessions, talk, and self-mute. A simple UDP-only demo is also provided.
 
 ## Features
 - Real-time audio streaming using UDP
@@ -21,15 +21,16 @@ cd Audio-Streaming
 ```
 
 ## Usage
-```bash
-javac *.java
-java AudioStreamingServer
-java AudioStreamingClient
-```
-- If your server/client accept arguments, a common pattern is:
-    - Server: java AudioStreamingServer [udpPort] [tcpPort]
-    - Client: java AudioStreamingClient [host] [udpPort] [tcpPort]
-    Replace with the actual arguments your implementation expects.
+This project uses a Swing UI and a server you can run directly from `App.java`:
+
+- Start server (TCP: 4444, UDP: 5555 by default):
+    - Run the app with argument `server`.
+- Start client UI:
+    - Run the app with argument `client`.
+- Start both locally (ephemeral ports) for a quick demo:
+    - Run the app with argument `local`.
+
+See `src/main/java/com/audiostreaming/App.java` for details.
 
 ## Quick tutorial: local test
 1) Start the server
@@ -58,6 +59,17 @@ java AudioStreamingClient
      - Use the client’s self-mute control to verify you stop sending audio.
      - Use the “mute other user” control to verify you stop receiving specific users.
 
+
+## Simple UDP-only demo
+If you want the smallest possible demo (no presence, no mute, no control channel), use the examples:
+
+1) In `Audio-Streaming/examples`:
+    - Compile: `javac SimpleUdpRelayServer.java SimpleUdpClient.java`
+    - Start server: `java SimpleUdpRelayServer 5555`
+2) On each client machine:
+    - Run: `java SimpleUdpClient <server_ip> 5555`
+
+More info in `docs/SIMPLE_MODE.md`.
 
 ## Tips and troubleshooting
 - Allow microphone permissions if prompted by your OS.

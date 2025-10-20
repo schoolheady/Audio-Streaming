@@ -218,6 +218,16 @@ public class VoiceChatClient {
     }
 
     /**
+     * Request the server to resend the current presence list to this client only.
+     * Useful to guarantee UI population if initial PRESENCE messages were missed.
+     */
+    public void requestPresenceSync() {
+        if (tcpChannel != null && tcpChannel.isConnected()) {
+            tcpChannel.sendCommand("SYNC");
+        }
+    }
+
+    /**
      * Leave the audio call but keep the TCP control channel connected. This allows the
      * user to "Leave Call" and later "Join Call" quickly without reconnecting to TCP.
      */

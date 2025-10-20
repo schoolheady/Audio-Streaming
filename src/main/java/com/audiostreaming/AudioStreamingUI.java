@@ -568,7 +568,9 @@ public class AudioStreamingUI {
     joined = true;
     System.out.println("[UI] - joined is now: " + joined + ", calling client.joinSession()");
     client.joinSession();
-    System.out.println("[UI] - client.joinSession() returned");
+    // Immediately request a presence sync to guarantee we have the full list
+    try { client.requestPresenceSync(); } catch (Exception ignored) {}
+    System.out.println("[UI] - client.joinSession() returned and SYNC requested");
         
         // Show Leave button, hide Join button
         if (joinButton != null) joinButton.setVisible(false);
