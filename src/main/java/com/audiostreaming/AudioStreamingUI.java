@@ -414,6 +414,7 @@ public class AudioStreamingUI {
         // raw handler that performs the actual UI updates; we'll wrap this in a safe listener
         java.util.function.Consumer<String> rawUiServerHandler = (line) -> {
             if (line == null) return;
+            System.out.println("[UI HANDLER] - Processing line: " + line + ", joined=" + joined);
             // process PRESENCE messages and OK response
             if (line.startsWith("PRESENCE ADD ")) {
                 String[] parts = line.split(" ", 4);
@@ -558,11 +559,16 @@ public class AudioStreamingUI {
                 System.err.println("[UI] - Exception in server listener: " + t);
             }
         };
-        client.addServerMessageListener(safeListener);
-        uiServerListener = safeListener;
+    client.addServerMessageListener(safeListener);
+    uiServerListener = safeListener;
 
-        client.joinSession();
-        joined = true;
+    // Important: mark as joined BEFORE starting the session so we don't drop
+    // initial PRESENCE messages (existing participants list) due to the joined guard.
+    System.out.println("[UI] - About to set joined=true and call joinSession()");
+    joined = true;
+    System.out.println("[UI] - joined is now: " + joined + ", calling client.joinSession()");
+    client.joinSession();
+    System.out.println("[UI] - client.joinSession() returned");
         
         // Show Leave button, hide Join button
         if (joinButton != null) joinButton.setVisible(false);
