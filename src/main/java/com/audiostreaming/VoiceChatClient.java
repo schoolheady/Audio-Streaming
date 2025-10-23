@@ -50,8 +50,31 @@ public class VoiceChatClient {
     public int ping() throws IOException {
         return sendCommands("PING", "PONG");
     }
+
+    public void startPingThread() {
+        Thread pingThread = new Thread(() -> {
+            while (true) {
+                try {
+                    int ret = ping();
+                    if (ret < 0) {
+                        System.out.println("Ping failed. Server may be unreachable.");
+                        leaveSession();
+                        break;
+                    }
+                    Thread.sleep(5000);
+                } catch (IOException | InterruptedException e) {
+                    System.err.println("Error in ping thread: " + e.getMessage());
+                    break;
+                }
+            }
+        });
+        pingThread.setDaemon(true);
+        pingThread.start();
+    }
+
     public void joinSession() throws IOException {
          int ret = sendCommands("JOIN", "JOIN_OK");
+         startPingThread();
          System.out.println("Joined session with client ID: " + assignedClientId);
          if(ret >= -1) {
              audioHandler.startStreaming(this.assignedClientId);

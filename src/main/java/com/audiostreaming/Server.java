@@ -75,6 +75,26 @@ public class Server{
         startTCPServer(ss);
     }
 
+    private void startTCPHeartbeatMonitor() {
+        new Thread(() -> {
+            while (serverRunning.get()) {
+                long now = System.currentTimeMillis();
+                for (Map.Entry<Integer, ClientState> entry : clientStates.entrySet()) {
+                    ClientState state = entry.getValue();
+                    if (now - state.lastPingTime > 15000) { // 15 seconds timeout
+                        state.status = ClientStatus.DISCONNECTED;
+                        logger.info("[TCP] - Client " + state.clientId + " marked as DISCONNECTED due to timeout");
+                    }
+                }
+                try {
+                    Thread.sleep(5000); // Check every 5 seconds
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, "tcp-heartbeat-monitor-thread").start();
+    }
+
     public void udpReceive() {
         byte[] buffer = new byte[1500];
         while (serverRunning.get()) {
@@ -167,6 +187,7 @@ public class Server{
 
     public void startTCPServer(ServerSocket providedSocket) throws Exception {
         serverRunning.set(true); 
+        startTCPHeartbeatMonitor();
         this.tcpServerSocket = providedSocket;
         logger.info("[SERVER] - Server starting TCP acceptor");
         try {
@@ -271,6 +292,8 @@ public class Server{
 
 
             case "PING" -> {
+                clientStates.get(clientId).lastPingTime = System.currentTimeMillis();
+                
                 send(out, "PONG");
                 return true;
             }   
@@ -338,6 +361,7 @@ public class Server{
                 state.clientId = clientId;
                 state.clientAddress = tcpSocket.getInetAddress();
                 state.clientPort = tcpSocket.getPort();
+                state.lastPingTime = System.currentTimeMillis();
                 state.clientUdpPort = -1; // to be set later
                 state.username = "User" + clientId; // get username from client later
                 clientStates.put(clientId, state);
@@ -430,6 +454,7 @@ class ClientState {
     int clientId; 
     int clientPort; 
     int clientUdpPort;
+    long lastPingTime;
     InetAddress clientAddress; 
     String username;
     ClientStatus status = ClientStatus.ACTIVE; // could be ACTIVE, MUTED, LEFT, DISCONNECTED
